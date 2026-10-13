@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.android.systemui.clipp;
 
-import android.content.*;
-import android.database.*;
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.webkit.MimeTypeMap;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileNotFoundException;
 
 /** Read-only files granted by ClipboardService; no broad external storage access. */
 public final class ClipboardImageProvider extends ContentProvider {
@@ -18,9 +21,10 @@ public final class ClipboardImageProvider extends ContentProvider {
         return true;
     }
 
-    private File file(Uri uri) throws FileNotFoundException {
+    private File imageFile(Uri uri) throws FileNotFoundException {
         String name = uri.getLastPathSegment();
-        if (name == null || !name.matches("[a-f0-9]{64}\\.(png|jpg|gif|webp|bmp|heic|heif|avif)"))
+        if (name == null
+                || !name.matches("[a-f0-9]{64}\\.(png|jpg|gif|webp|bmp|heic|heif|avif|wbmp)"))
             throw new FileNotFoundException("Invalid image URI");
         File f = new File(new File(getContext().getFilesDir(), "Clipp/images"), name);
         if (!f.isFile()) throw new FileNotFoundException("Image unavailable");
@@ -30,7 +34,7 @@ public final class ClipboardImageProvider extends ContentProvider {
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
         if (!"r".equals(mode)) throw new FileNotFoundException("Read only");
-        return ParcelFileDescriptor.open(file(uri), ParcelFileDescriptor.MODE_READ_ONLY);
+        return ParcelFileDescriptor.open(imageFile(uri), ParcelFileDescriptor.MODE_READ_ONLY);
     }
 
     @Override
@@ -43,18 +47,23 @@ public final class ClipboardImageProvider extends ContentProvider {
     }
 
     @Override
-    public Cursor query(Uri uri, String[] projection, String s, String[] a, String sort) {
+    public Cursor query(
+            Uri uri,
+            String[] projection,
+            String selection,
+            String[] selectionArgs,
+            String sortOrder) {
         try {
-            File f = file(uri);
-            String[] cols =
+            File image = imageFile(uri);
+            String[] columns =
                     projection == null
                             ? new String[] {OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}
                             : projection;
-            MatrixCursor cursor = new MatrixCursor(cols);
-            Object[] row = new Object[cols.length];
-            for (int i = 0; i < cols.length; i++) {
-                if (OpenableColumns.DISPLAY_NAME.equals(cols[i])) row[i] = f.getName();
-                if (OpenableColumns.SIZE.equals(cols[i])) row[i] = f.length();
+            MatrixCursor cursor = new MatrixCursor(columns);
+            Object[] row = new Object[columns.length];
+            for (int i = 0; i < columns.length; i++) {
+                if (OpenableColumns.DISPLAY_NAME.equals(columns[i])) row[i] = image.getName();
+                if (OpenableColumns.SIZE.equals(columns[i])) row[i] = image.length();
             }
             cursor.addRow(row);
             return cursor;
@@ -64,17 +73,17 @@ public final class ClipboardImageProvider extends ContentProvider {
     }
 
     @Override
-    public Uri insert(Uri u, ContentValues v) {
+    public Uri insert(Uri uri, ContentValues values) {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    public int delete(Uri u, String s, String[] a) {
+    public int delete(Uri uri, String selection, String[] selectionArgs) {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    public int update(Uri u, ContentValues v, String s, String[] a) {
+    public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
         throw new UnsupportedOperationException();
     }
 }

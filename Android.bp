@@ -17,6 +17,14 @@ filegroup {
     srcs: ["common/src/**/*.java", "settings/src/**/*.java"],
     visibility: ["//packages/apps/Settings:__pkg__"],
 }
+filegroup {
+    name: "evolution-clipp-systemui-manifest",
+    srcs: ["systemui/AndroidManifest.xml"],
+    visibility: [
+        "//frameworks/base/packages/SystemUI:__pkg__",
+        "//vendor:__subpackages__",
+    ],
+}
 cc_library_static {
     name: "libevolution_clipp_sodium",
     host_supported: true,
@@ -37,7 +45,7 @@ cc_library_static {
 }
 cc_library_shared {
     name: "libevolution_clipp_jni",
-    required: ["clipp-default-permissions"],
+    required: ["clipp-default-permissions", "clipp-privapp-permissions"],
     host_supported: true,
     compile_multilib: "64",
     srcs: ["native/crypto.cpp", "native/xxhash.c"],
@@ -54,5 +62,13 @@ prebuilt_etc {
     src: "permissions/default-permissions-clipp.xml",
     filename: "default-permissions-clipp.xml",
     sub_dir: "default-permissions",
+    system_ext_specific: true,
+}
+
+prebuilt_etc {
+    name: "clipp-privapp-permissions",
+    src: "permissions/privapp-permissions-clipp.xml",
+    filename: "privapp-permissions-clipp.xml",
+    sub_dir: "permissions",
     system_ext_specific: true,
 }
