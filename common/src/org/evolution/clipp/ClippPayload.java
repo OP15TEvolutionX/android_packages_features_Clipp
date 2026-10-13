@@ -4,7 +4,6 @@ package org.evolution.clipp;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.Locale;
 
 /** Android clipboard content identity is separate from Clipp wire metadata. */
 public final class ClippPayload {
@@ -29,8 +28,6 @@ public final class ClippPayload {
 
     public static String sha256(byte[] bytes) throws Exception {
         byte[] hash = MessageDigest.getInstance("SHA-256").digest(bytes);
-        StringBuilder s = new StringBuilder();
-        for (byte b : hash) s.append(String.format(Locale.ROOT, "%02x", b & 255));
-        return s.toString();
+        return ClippBytes.hex(hash);
     }
 }

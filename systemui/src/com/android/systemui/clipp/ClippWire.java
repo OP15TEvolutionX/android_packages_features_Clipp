@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.android.systemui.clipp;
 
+import org.evolution.clipp.ClippBytes;
 import org.evolution.clipp.ClippCrypto;
 
-import java.io.*;
-import java.nio.*;
-import java.nio.charset.*;
-import java.util.*;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.UUID;
 
 /** Compatible Clipp binary framing; authentication precedes every clipboard frame. */
 public final class ClippWire {
@@ -15,7 +21,37 @@ public final class ClippWire {
             PNG = 8,
             TEXT = 13,
             JPEG = 0x434a5047,
-            MAX_FRAME = 50 * 1024 * 1024 + HEADER + 21;
+            MAX_IMAGE_BYTES = 50 * 1024 * 1024,
+            MAX_FRAME = MAX_IMAGE_BYTES + HEADER + 21;
+
+    public static final int FLAG_REPLAY = 1;
+    public static final int FLAG_PRIVATE = 2;
+    public static final int FLAG_RELAY = 4;
+
+    // Packed ClipboardMessage layout from upstream NetworkDefs.h (big endian).
+    private static final int FLAGS = 0;
+    private static final int TIMESTAMP = 4;
+    private static final int HASH_ALGORITHM = 12;
+    private static final int HASH = 16;
+    private static final int ORIGIN = 80;
+    private static final int ORIGIN_NAME = 96;
+    private static final int SEQUENCE = 224;
+    private static final int EVENT = 232;
+    private static final int FORMAT = 264;
+    private static final int COMPRESSED = 268;
+    private static final int ENCODED_SIZE = 269;
+    private static final int PLAIN_SIZE = 277;
+    private static final int ID_SIZE = 16;
+    private static final int NAME_SIZE = 128;
+
+    // CryptoChannel handshake and libsodium sizes; these are protocol, not Android policy.
+    private static final int HANDSHAKE_SIZE = 192;
+    private static final int SEALED_HANDSHAKE_SIZE = 232;
+    private static final int KEY_SIZE = 32;
+    private static final int STREAM_HEADER_SIZE = 24;
+    private static final int HANDSHAKE_HOST = 32;
+    private static final int HANDSHAKE_CAPS = 48;
+    private static final int HANDSHAKE_NAME = 64;
 
     public static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
@@ -33,9 +69,7 @@ public final class ClippWire {
     }
 
     public static String hex(byte[] a) {
-        StringBuilder b = new StringBuilder();
-        for (byte v : a) b.append(String.format(Locale.ROOT, "%02x", v & 255));
-        return b.toString();
+        return ClippBytes.hex(a);
     }
 
     public static void name(byte[] a, int offset, int size, String s) {
@@ -61,16 +95,16 @@ public final class ClippWire {
             header = h;
             data = d;
             ByteBuffer b = ByteBuffer.wrap(h);
-            flags = b.getInt(0);
-            timestamp = b.getLong(4);
-            format = b.getInt(264);
-            event = hex(Arrays.copyOfRange(h, 232, 248));
-            origin = hex(Arrays.copyOfRange(h, 80, 96));
+            flags = b.getInt(FLAGS);
+            timestamp = b.getLong(TIMESTAMP);
+            format = b.getInt(FORMAT);
+            event = hex(Arrays.copyOfRange(h, EVENT, EVENT + ID_SIZE));
+            origin = hex(Arrays.copyOfRange(h, ORIGIN, ORIGIN + ID_SIZE));
         }
 
         public Item withFlags(int flags) {
             byte[] copy = header.clone();
-            ByteBuffer.wrap(copy).putInt(0, flags);
+            ByteBuffer.wrap(copy).putInt(FLAGS, flags);
             return new Item(copy, data);
         }
 
@@ -78,7 +112,7 @@ public final class ClippWire {
             byte[] out = new byte[4 + HEADER + data.length];
             System.arraycopy(utf8("CLIP"), 0, out, 0, 4);
             System.arraycopy(header, 0, out, 4, HEADER);
-            if (replay) ByteBuffer.wrap(out).putInt(4, flags | 1);
+            if (replay) ByteBuffer.wrap(out).putInt(4 + FLAGS, flags | FLAG_REPLAY);
             System.arraycopy(data, 0, out, 4 + HEADER, data.length);
             return out;
         }
@@ -94,16 +128,16 @@ public final class ClippWire {
                                     .replace('\r', '\n'));
         byte[] h = new byte[HEADER];
         ByteBuffer b = ByteBuffer.wrap(h);
-        b.putLong(4, timestamp);
-        h[12] = 1;
-        System.arraycopy(ClippCrypto.call(12, data, integer(format), null), 0, h, 16, 16);
-        System.arraycopy(host, 0, h, 80, 16);
-        name(h, 96, 128, name);
-        b.putLong(224, sequence);
-        System.arraycopy(uuid(UUID.randomUUID()), 0, h, 232, 16);
-        b.putInt(264, format);
-        b.putLong(269, data.length);
-        b.putLong(277, data.length);
+        b.putLong(TIMESTAMP, timestamp);
+        h[HASH_ALGORITHM] = 1;
+        System.arraycopy(ClippCrypto.contentHash(data, format), 0, h, HASH, ID_SIZE);
+        System.arraycopy(host, 0, h, ORIGIN, ID_SIZE);
+        name(h, ORIGIN_NAME, NAME_SIZE, name);
+        b.putLong(SEQUENCE, sequence);
+        System.arraycopy(uuid(UUID.randomUUID()), 0, h, EVENT, ID_SIZE);
+        b.putInt(FORMAT, format);
+        b.putLong(ENCODED_SIZE, data.length);
+        b.putLong(PLAIN_SIZE, data.length);
         return new Item(h, data);
     }
 
@@ -111,32 +145,31 @@ public final class ClippWire {
         if (frame.length < 4 + HEADER) throw new IOException("Frame");
         byte[] h = Arrays.copyOfRange(frame, 4, 4 + HEADER);
         ByteBuffer b = ByteBuffer.wrap(h);
-        int format = b.getInt(264);
-        long encoded = b.getLong(269), plain = b.getLong(277);
+        int format = b.getInt(FORMAT);
+        long encoded = b.getLong(ENCODED_SIZE), plain = b.getLong(PLAIN_SIZE);
         int limit = format == TEXT ? 1024 * 1024 : imageLimit;
         if ((format != TEXT && format != PNG && format != JPEG)
                 || encoded < 0
                 || encoded != frame.length - 4 - HEADER
                 || plain < 0
                 || plain > limit
-                || h[268] < 0
-                || h[268] > 1) throw new IOException("Payload");
+                || h[COMPRESSED] < 0
+                || h[COMPRESSED] > 1) throw new IOException("Payload");
         byte[] data = Arrays.copyOfRange(frame, 4 + HEADER, frame.length);
-        if (h[268] == 1)
+        if (h[COMPRESSED] == 1)
             try {
-                data = ClippCrypto.call(11, data, integer((int) plain), null);
+                data = ClippCrypto.decompress(data, (int) plain);
             } catch (RuntimeException e) {
                 throw new IOException("Compression", e);
             }
         else if (encoded != plain) throw new IOException("Size");
-        if (h[12] != 0 && h[12] != 1) throw new IOException("Hash");
-        if (h[12] == 1
+        if (h[HASH_ALGORITHM] != 0 && h[HASH_ALGORITHM] != 1) throw new IOException("Hash");
+        if (h[HASH_ALGORITHM] == 1
                 && !Arrays.equals(
-                        Arrays.copyOfRange(h, 16, 32),
-                        ClippCrypto.call(12, data, integer(format), null)))
-            throw new IOException("Hash");
-        h[268] = 0;
-        b.putLong(269, data.length);
+                        Arrays.copyOfRange(h, HASH, HASH + ID_SIZE),
+                        ClippCrypto.contentHash(data, format))) throw new IOException("Hash");
+        h[COMPRESSED] = 0;
+        b.putLong(ENCODED_SIZE, data.length);
         return new Item(h, data);
     }
 
@@ -144,6 +177,7 @@ public final class ClippWire {
         private final DataInputStream in;
         private final DataOutputStream out;
         private byte[] tx, rx;
+        private boolean receiveBudgetHeld;
         public final byte[] remoteId;
         public final String remoteName;
         public final int remoteCaps;
@@ -158,48 +192,70 @@ public final class ClippWire {
                 throws IOException {
             in = new DataInputStream(input);
             out = new DataOutputStream(output);
+            byte[] pair = null, keys = null, push = null;
+            boolean authenticated = false;
             try {
-                byte[] pair = ClippCrypto.call(4, null, null, null), local = new byte[192];
-                System.arraycopy(pair, 0, local, 0, 32);
-                System.arraycopy(host, 0, local, 32, 16);
-                local[48] = 1;
-                name(local, 64, 128, name);
+                pair = ClippCrypto.keyPair();
+                byte[] local = new byte[HANDSHAKE_SIZE];
+                System.arraycopy(pair, 0, local, 0, KEY_SIZE);
+                System.arraycopy(host, 0, local, HANDSHAKE_HOST, ID_SIZE);
+                local[HANDSHAKE_CAPS] = 1;
+                name(local, HANDSHAKE_NAME, NAME_SIZE, name);
                 byte[] remote;
                 if (client) {
-                    out.write(ClippCrypto.call(2, ClippCrypto.role(root, 1), local, null));
+                    out.write(
+                            ClippCrypto.sealWithRole(
+                                    root, ClippCrypto.ROLE_CLIENT_TO_SERVER, local));
                     out.flush();
-                    remote = ClippCrypto.call(3, ClippCrypto.role(root, 2), read(232), null);
+                    remote =
+                            ClippCrypto.openWithRole(
+                                    root,
+                                    ClippCrypto.ROLE_SERVER_TO_CLIENT,
+                                    read(SEALED_HANDSHAKE_SIZE));
                 } else {
-                    remote = ClippCrypto.call(3, ClippCrypto.role(root, 1), read(232), null);
-                    out.write(ClippCrypto.call(2, ClippCrypto.role(root, 2), local, null));
+                    remote =
+                            ClippCrypto.openWithRole(
+                                    root,
+                                    ClippCrypto.ROLE_CLIENT_TO_SERVER,
+                                    read(SEALED_HANDSHAKE_SIZE));
+                    out.write(
+                            ClippCrypto.sealWithRole(
+                                    root, ClippCrypto.ROLE_SERVER_TO_CLIENT, local));
                     out.flush();
                 }
-                if (remote.length != 192) throw new IOException("Handshake");
-                remoteId = Arrays.copyOfRange(remote, 32, 48);
-                remoteCaps = remote[48] & 255;
-                remoteName = name(remote, 64, 128);
-                byte[] keys =
-                        ClippCrypto.call(
-                                client ? 5 : 6, pair, Arrays.copyOfRange(remote, 0, 32), null);
-                Arrays.fill(pair, (byte) 0);
-                byte[] push = ClippCrypto.call(7, Arrays.copyOfRange(keys, 32, 64), null, null);
-                tx = Arrays.copyOf(push, push.length - 24);
+                if (remote.length != HANDSHAKE_SIZE) throw new IOException("Handshake");
+                remoteId = Arrays.copyOfRange(remote, HANDSHAKE_HOST, HANDSHAKE_HOST + ID_SIZE);
+                remoteCaps = remote[HANDSHAKE_CAPS] & 255;
+                remoteName = name(remote, HANDSHAKE_NAME, NAME_SIZE);
+                keys =
+                        ClippCrypto.sessionKeys(
+                                client, pair, Arrays.copyOfRange(remote, 0, KEY_SIZE));
+                push = ClippCrypto.initPush(Arrays.copyOfRange(keys, KEY_SIZE, KEY_SIZE * 2));
+                tx = Arrays.copyOf(push, push.length - STREAM_HEADER_SIZE);
                 if (client) {
-                    out.write(push, push.length - 24, 24);
+                    out.write(push, push.length - STREAM_HEADER_SIZE, STREAM_HEADER_SIZE);
                     out.flush();
-                    rx = ClippCrypto.call(8, Arrays.copyOf(keys, 32), read(24), null);
+                    rx =
+                            ClippCrypto.initPull(
+                                    Arrays.copyOf(keys, KEY_SIZE), read(STREAM_HEADER_SIZE));
                     send(utf8("DONE"));
                 } else {
-                    rx = ClippCrypto.call(8, Arrays.copyOf(keys, 32), read(24), null);
-                    out.write(push, push.length - 24, 24);
+                    rx =
+                            ClippCrypto.initPull(
+                                    Arrays.copyOf(keys, KEY_SIZE), read(STREAM_HEADER_SIZE));
+                    out.write(push, push.length - STREAM_HEADER_SIZE, STREAM_HEADER_SIZE);
                     out.flush();
                     if (!Arrays.equals(receive(64), utf8("DONE")))
                         throw new IOException("Handshake");
                 }
-                Arrays.fill(keys, (byte) 0);
-                Arrays.fill(push, (byte) 0);
+                authenticated = true;
             } catch (RuntimeException e) {
                 throw new IOException("Authentication", e);
+            } finally {
+                if (pair != null) Arrays.fill(pair, (byte) 0);
+                if (keys != null) Arrays.fill(keys, (byte) 0);
+                if (push != null) Arrays.fill(push, (byte) 0);
+                if (!authenticated) wipe();
             }
         }
 
@@ -212,7 +268,7 @@ public final class ClippWire {
         public synchronized void send(byte[] frame) throws IOException {
             if (frame.length > MAX_FRAME - 17) throw new IOException("Frame limit");
             try {
-                byte[] encrypted = ClippCrypto.call(9, tx, frame, null);
+                byte[] encrypted = ClippCrypto.push(tx, frame);
                 out.writeInt(encrypted.length);
                 out.write(encrypted);
                 out.flush();
@@ -230,7 +286,7 @@ public final class ClippWire {
             if (n < 21 || n > Math.min(MAX_FRAME, max)) throw new IOException("Frame limit");
             boolean acquired = false, returned = false;
             try {
-                if (budget != null) {
+                if (budget != null && n > 4096) {
                     try {
                         acquired = budget.tryAcquire(60, java.util.concurrent.TimeUnit.SECONDS);
                     } catch (InterruptedException e) {
@@ -239,7 +295,23 @@ public final class ClippWire {
                     }
                     if (!acquired) throw new IOException("Busy");
                 }
-                byte[] frame = ClippCrypto.call(10, rx, read(n), null);
+                byte[] frame = ClippCrypto.pull(rx, read(n));
+                if (budget != null
+                        && !acquired
+                        && frame.length >= 4
+                        && frame[0] == 67
+                        && frame[1] == 76
+                        && frame[2] == 73
+                        && frame[3] == 80) {
+                    try {
+                        acquired = budget.tryAcquire(60, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Stopped", e);
+                    }
+                    if (!acquired) throw new IOException("Busy");
+                }
+                receiveBudgetHeld = acquired;
                 returned = true;
                 return frame;
             } catch (RuntimeException e) {
@@ -249,7 +321,14 @@ public final class ClippWire {
             }
         }
 
-        public void wipe() {
+        public void releaseReceiveBudget(java.util.concurrent.Semaphore budget) {
+            if (receiveBudgetHeld) {
+                receiveBudgetHeld = false;
+                budget.release();
+            }
+        }
+
+        public synchronized void wipe() {
             if (tx != null) Arrays.fill(tx, (byte) 0);
             if (rx != null) Arrays.fill(rx, (byte) 0);
         }

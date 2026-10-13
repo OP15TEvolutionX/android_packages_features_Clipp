@@ -3,24 +3,54 @@
 package com.android.systemui.clipp;
 
 import android.app.KeyguardManager;
-import android.content.*;
+import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.database.ContentObserver;
-import android.graphics.*;
-import android.net.*;
-import android.os.*;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PersistableBundle;
+import android.os.PowerManager;
+import android.os.UserManager;
 import android.util.Base64;
 import android.webkit.MimeTypeMap;
 
-import org.evolution.clipp.*;
-import org.json.*;
+import org.evolution.clipp.ClippContract;
+import org.evolution.clipp.ClippPayload;
+import org.json.JSONObject;
 
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** Native clipboard bridge, event-driven discovery, and a five-minute screen-off grace period. */
+/** Native clipboard bridge, event-driven discovery, and deep-Doze network suspension. */
 public final class ClippEngine implements AutoCloseable {
     private final Context context;
     private final ClipboardManager clipboard;
@@ -33,13 +63,10 @@ public final class ClippEngine implements AutoCloseable {
     private JSONObject config = new JSONObject();
     private String runtimeKey = "";
     private volatile String current = "", publishedImage = "";
-    private ClippPayload latest;
     private ClippWire.Item localItem;
     private volatile ClippPayload deferred;
     private final AtomicLong localRevision = new AtomicLong();
-    private volatile long lastLocalTime;
-    private long graceUntil;
-    private ScheduledFuture<?> graceTimer;
+    private final Object networkLifecycle = new Object();
     private final LinkedHashMap<String, Boolean> seen = new LinkedHashMap<>();
     private final ClipboardManager.OnPrimaryClipChangedListener clips = this::localChanged;
     private final ContentObserver observer =
@@ -70,28 +97,36 @@ public final class ClippEngine implements AutoCloseable {
             new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context c, Intent i) {
+                    if (context.getSystemService(PowerManager.class).isDeviceIdleMode()) {
+                        // Do not wait behind image decoding or file I/O on the worker.
+                        synchronized (networkLifecycle) {
+                            enabled = false;
+                            generation++;
+                            ClippTransport old = transport;
+                            transport = null;
+                            if (old != null) old.close();
+                        }
+                    }
                     enqueue(
                             () -> {
-                                String action = i.getAction();
-                                if (Intent.ACTION_SCREEN_OFF.equals(action)) {
-                                    graceUntil = SystemClock.elapsedRealtime() + 300000;
-                                    if (graceTimer != null) graceTimer.cancel(false);
-                                    graceTimer =
-                                            worker.schedule(
-                                                    ClippEngine.this::reload,
-                                                    300000,
-                                                    TimeUnit.MILLISECONDS);
-                                } else if (Intent.ACTION_USER_PRESENT.equals(action)) {
-                                    graceUntil = 0;
-                                    if (graceTimer != null) graceTimer.cancel(false);
+                                if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(
+                                        i.getAction())) {
                                     runtimeKey = "";
                                 }
-                                reload();
-                                if (Intent.ACTION_USER_PRESENT.equals(action) && deferred != null)
-                                    try {
-                                        apply(deferred, generation);
-                                    } catch (Exception ignored) {
+                                reloadOnWorker();
+                                if (Intent.ACTION_USER_PRESENT.equals(i.getAction())) {
+                                    ClippPayload pending = deferred;
+                                    if (enabled && pending != null) {
+                                        try {
+                                            apply(pending, generation, true);
+                                        } catch (Exception error) {
+                                            android.util.Log.w(
+                                                    "ClippEngine",
+                                                    "Deferred clipboard update failed",
+                                                    error);
+                                        }
                                     }
+                                }
                             });
                 }
             };
@@ -100,7 +135,6 @@ public final class ClippEngine implements AutoCloseable {
         this.context = context;
         clipboard = context.getSystemService(ClipboardManager.class);
         connectivity = context.getSystemService(ConnectivityManager.class);
-        lastLocalTime = context.getSharedPreferences("clipp_local", 0).getLong("copied", 0);
     }
 
     public void start() {
@@ -113,11 +147,12 @@ public final class ClippEngine implements AutoCloseable {
                         .build(),
                 networks);
         IntentFilter filter = new IntentFilter();
-        filter.addAction(Intent.ACTION_SCREEN_OFF);
-        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
         filter.addAction(Intent.ACTION_USER_PRESENT);
         filter.addAction(Intent.ACTION_USER_UNLOCKED);
-        context.registerReceiver(screen, filter, Context.RECEIVER_NOT_EXPORTED);
+        // USER_PRESENT is emitted by SystemUI as an implicit broadcast. Android filters
+        // non-exported receivers even for the same app UID. All actions here are protected.
+        context.registerReceiver(screen, filter, Context.RECEIVER_EXPORTED);
         reload();
     }
 
@@ -137,132 +172,122 @@ public final class ClippEngine implements AutoCloseable {
     }
 
     private void reload() {
-        enqueue(
-                () -> {
-                    try {
-                        JSONObject next = ClippContract.read(context.getContentResolver());
-                        Network wifi = null;
-                        for (Network n : connectivity.getAllNetworks()) {
-                            NetworkCapabilities caps = connectivity.getNetworkCapabilities(n);
-                            if (caps != null
-                                    && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                                wifi = n;
-                                break;
-                            }
-                        }
-                        boolean interactive =
-                                context.getSystemService(PowerManager.class).isInteractive();
-                        boolean unlocked =
-                                !context.getSystemService(KeyguardManager.class).isDeviceLocked();
-                        boolean active =
-                                next.optBoolean("enabled")
-                                        && context.getSystemService(UserManager.class)
-                                                .isUserUnlocked()
-                                        && ((interactive && unlocked)
-                                                || (graceUntil > SystemClock.elapsedRealtime()));
-                        String key =
-                                next.toString()
-                                        + ":"
-                                        + wifi
-                                        + ":"
-                                        + (wifi == null ? "" : connectivity.getLinkProperties(wifi))
-                                        + ":"
-                                        + active;
-                        if (key.equals(runtimeKey)) return;
-                        runtimeKey = key;
-                        config = next;
-                        generation++;
-                        enabled = active;
-                        ClippTransport old = transport;
-                        transport = null;
-                        if (old != null) old.close();
-                        status("devices", "{}");
-                        if (!next.optBoolean("enabled")) {
-                            localItem = null;
-                            latest = null;
-                            deferred = null;
-                            current = "";
-                        }
-                        if (!active || wifi == null) {
-                            status("network", active ? "waiting_wifi" : "paused");
-                            return;
-                        }
-                        LinkProperties props = connectivity.getLinkProperties(wifi);
-                        java.net.InetAddress address = null;
-                        if (props != null)
-                            for (LinkAddress a : props.getLinkAddresses())
-                                if (a.getAddress() instanceof java.net.Inet4Address) {
-                                    address = a.getAddress();
-                                    break;
-                                }
-                        if (address == null) {
-                            status("network", "waiting_wifi");
-                            return;
-                        }
-                        byte[] root = Base64.decode(next.getString("root"), Base64.NO_WRAP),
-                                host = parseHost(next.getString("hostId"));
-                        Set<String> blocked = new HashSet<>();
-                        JSONArray list = next.optJSONArray("blocked");
-                        if (list != null)
-                            for (int i = 0; i < list.length(); i++) blocked.add(list.getString(i));
-                        int epoch = generation;
-                        ClippTransport t =
-                                new ClippTransport(
-                                        context,
-                                        wifi,
-                                        address,
-                                        root,
-                                        host,
-                                        android.os.Build.MODEL,
-                                        imageLimit(),
-                                        blocked,
-                                        new ClippTransport.Events() {
-                                            public void state(
-                                                    String id, String name, String state) {
-                                                if (!closed && epoch == generation)
-                                                    try {
-                                                        status(
-                                                                id,
-                                                                id.equals("network")
-                                                                        ? state
-                                                                        : new JSONObject()
-                                                                                .put("name", name)
-                                                                                .put("state", state)
-                                                                                .toString());
-                                                    } catch (Exception ignored) {
-                                                    }
-                                            }
+        enqueue(this::reloadOnWorker);
+    }
 
-                                            public void receive(ClippWire.Item item) {
-                                                if (closed) return;
-                                                final long revision = localRevision.get();
-                                                try {
-                                                    worker.submit(
-                                                                    () -> {
-                                                                        if (!closed
-                                                                                && enabled
-                                                                                && epoch
-                                                                                        == generation
-                                                                                && revision
-                                                                                        == localRevision
-                                                                                                .get())
-                                                                            receiveRemote(
-                                                                                    item, epoch);
-                                                                    })
-                                                            .get(30, TimeUnit.SECONDS);
-                                                } catch (Exception ignored) {
-                                                }
-                                            }
-                                        });
-                        Arrays.fill(root, (byte) 0);
-                        transport = t;
-                        if (localItem != null) t.publish(localItem);
-                        t.start();
-                        if (deferred != null) apply(deferred, epoch);
-                    } catch (Exception e) {
-                        status("network", "connection_error");
+    /** Configuration and clipboard state are confined to the worker thread. */
+    private void reloadOnWorker() {
+        try {
+            JSONObject next = ClippContract.read(context.getContentResolver());
+            Network wifi = null;
+            for (Network n : connectivity.getAllNetworks()) {
+                NetworkCapabilities caps = connectivity.getNetworkCapabilities(n);
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    wifi = n;
+                    break;
+                }
+            }
+            boolean active =
+                    next.optBoolean("enabled")
+                            && context.getSystemService(UserManager.class).isUserUnlocked()
+                            && !context.getSystemService(PowerManager.class).isDeviceIdleMode();
+            String key =
+                    next.toString()
+                            + ":"
+                            + wifi
+                            + ":"
+                            + (wifi == null ? "" : connectivity.getLinkProperties(wifi))
+                            + ":"
+                            + active;
+            if (key.equals(runtimeKey)) return;
+            runtimeKey = key;
+            config = next;
+            generation++;
+            enabled = active;
+            ClippTransport old = transport;
+            transport = null;
+            if (old != null) old.close();
+            status("devices", "{}");
+            if (!next.optBoolean("enabled")) {
+                localItem = null;
+                deferred = null;
+                current = "";
+            }
+            if (!active || wifi == null) return;
+            LinkProperties props = connectivity.getLinkProperties(wifi);
+            java.net.InetAddress address = null;
+            if (props != null)
+                for (LinkAddress a : props.getLinkAddresses())
+                    if (a.getAddress() instanceof java.net.Inet4Address) {
+                        address = a.getAddress();
+                        break;
                     }
-                });
+            if (address == null) return;
+            byte[] host = parseHost(next.getString("hostId"));
+            int epoch = generation;
+            byte[] root = Base64.decode(next.getString("root"), Base64.NO_WRAP);
+            ClippTransport t;
+            try {
+                t =
+                        new ClippTransport(
+                                context,
+                                wifi,
+                                address,
+                                root,
+                                host,
+                                android.os.Build.MODEL,
+                                ClippWire.MAX_IMAGE_BYTES,
+                                transportEvents(epoch));
+            } finally {
+                Arrays.fill(root, (byte) 0);
+            }
+            synchronized (networkLifecycle) {
+                if (epoch != generation
+                        || closed
+                        || context.getSystemService(PowerManager.class).isDeviceIdleMode()) {
+                    enabled = false;
+                    t.close();
+                    runtimeKey = "";
+                    return;
+                }
+                transport = t;
+                if (localItem != null) t.publish(localItem);
+                t.start();
+            }
+        } catch (Exception e) {
+            android.util.Log.w("ClippEngine", "Clipboard operation failed", e);
+        }
+    }
+
+    private ClippTransport.Events transportEvents(int epoch) {
+        return new ClippTransport.Events() {
+            public void state(String id, String name, String state) {
+                if (!closed && epoch == generation && !id.equals("network"))
+                    try {
+                        status(
+                                id,
+                                new JSONObject().put("name", name).put("state", state).toString());
+                    } catch (Exception ignored) {
+                    }
+            }
+
+            public void receive(ClippWire.Item item) {
+                if (closed) return;
+                final long revision = localRevision.get();
+                try {
+                    worker.submit(
+                                    () -> {
+                                        if (!closed
+                                                && enabled
+                                                && epoch == generation
+                                                && revision == localRevision.get())
+                                            receiveRemote(item, epoch);
+                                    })
+                            .get(30, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+            }
+        };
     }
 
     private static byte[] parseHost(String s) {
@@ -273,21 +298,14 @@ public final class ClippEngine implements AutoCloseable {
         return id;
     }
 
-    private int imageLimit() {
-        return Math.max(5, Math.min(50, config.optInt("maxImageMb", 20))) * 1024 * 1024;
-    }
-
     private void receiveRemote(ClippWire.Item wire, int epoch) {
         try {
-            if ((wire.flags & 2) != 0 || seen.containsKey(wire.event)) return;
+            if ((wire.flags & (ClippWire.FLAG_PRIVATE | ClippWire.FLAG_REPLAY)) != 0
+                    || seen.containsKey(wire.event)) return;
             seen.put(wire.event, true);
             while (seen.size() > 256) seen.remove(seen.keySet().iterator().next());
-            // A reconnect supplies only the latest item. Never overwrite a newer local copy with
-            // catch-up.
-            if ((wire.flags & 1) != 0
-                    && (wire.timestamp <= lastLocalTime || wire.timestamp <= remoteTime)) return;
             ClippPayload item;
-            if (wire.format == ClippWire.TEXT && config.optBoolean("text", true)) {
+            if (wire.format == ClippWire.TEXT) {
                 if (wire.data.length > 1024 * 1024) return;
                 String text =
                         StandardCharsets.UTF_8
@@ -295,10 +313,11 @@ public final class ClippEngine implements AutoCloseable {
                                 .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
                                 .decode(java.nio.ByteBuffer.wrap(wire.data))
                                 .toString();
+                // Desktop clipboard capture includes a C-string terminator in the wire data.
+                if (text.endsWith("\u0000")) text = text.substring(0, text.length() - 1);
                 item = ClippPayload.text(text);
-            } else if ((wire.format == ClippWire.PNG || wire.format == ClippWire.JPEG)
-                    && config.optBoolean("images", true)) {
-                if (wire.data.length > imageLimit()) return;
+            } else if (wire.format == ClippWire.PNG || wire.format == ClippWire.JPEG) {
+                if (wire.data.length > ClippWire.MAX_IMAGE_BYTES) return;
                 BitmapFactory.Options info = new BitmapFactory.Options();
                 info.inJustDecodeBounds = true;
                 BitmapFactory.decodeByteArray(wire.data, 0, wire.data.length, info);
@@ -313,28 +332,24 @@ public final class ClippEngine implements AutoCloseable {
                                 mime,
                                 "clipp." + (wire.format == ClippWire.PNG ? "png" : "jpg"));
             } else return;
-            if (!item.key.equals(current)) {
-                current = item.key;
-                latest = item;
-                apply(item, epoch);
-            }
-            remoteTime =
-                    Math.max(
-                            remoteTime,
-                            Math.min(wire.timestamp, System.currentTimeMillis() + 300000));
-            localItem = wire.withFlags(wire.flags & ~5);
+            // Event IDs suppress delivery duplicates. Equal content can still be a new copy,
+            // especially when the previous clipboard write was postponed or cancelled.
+            current = item.key;
+            // Retain before posting: lock/Doze may cancel the main-thread write.
+            deferred = item;
+            apply(item, epoch, false);
+            localItem =
+                    wire.withFlags(wire.flags & ~(ClippWire.FLAG_REPLAY | ClippWire.FLAG_RELAY));
             ClippTransport active = transport;
             if (active != null) {
                 active.remember(localItem);
-                if ((wire.flags & 4) != 0) active.publish(localItem);
+                if ((wire.flags & ClippWire.FLAG_RELAY) != 0) active.publish(localItem);
             }
             // Ordinary mesh packets are already delivered to all peers. Do not relay them again.
         } catch (Exception e) {
-            status("network", "connection_error");
+            android.util.Log.w("ClippEngine", "Remote clipboard rejected", e);
         }
     }
-
-    private long remoteTime;
 
     private void localChanged() {
         if (closed) return;
@@ -343,11 +358,6 @@ public final class ClippEngine implements AutoCloseable {
             if (config.optBoolean("enabled")) {
                 localRevision.incrementAndGet();
                 deferred = null;
-                lastLocalTime = System.currentTimeMillis();
-                context.getSharedPreferences("clipp_local", 0)
-                        .edit()
-                        .putLong("copied", lastLocalTime)
-                        .apply();
             }
             return;
         }
@@ -358,19 +368,19 @@ public final class ClippEngine implements AutoCloseable {
             return;
         }
         if (clip == null || clip.getItemCount() == 0) return;
+        Uri imageUri = clip.getItemAt(0).getUri();
+        publishedImage =
+                imageUri != null && ClippContract.IMAGE_AUTHORITY.equals(imageUri.getAuthority())
+                        ? imageUri.getLastPathSegment()
+                        : "";
         PersistableBundle extras = clip.getDescription().getExtras();
         if (extras != null && extras.getBoolean("org.evolution.clipp.received")) return;
         localRevision.incrementAndGet();
         deferred = null;
-        lastLocalTime = System.currentTimeMillis();
-        context.getSharedPreferences("clipp_local", 0)
-                .edit()
-                .putLong("copied", lastLocalTime)
-                .apply();
         if (!enabled || (extras != null && extras.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE)))
             return;
         int epoch = generation;
-        long copied = lastLocalTime;
+        long copied = System.currentTimeMillis();
         enqueue(
                 () -> {
                     if (!enabled || epoch != generation) return;
@@ -382,12 +392,10 @@ public final class ClippEngine implements AutoCloseable {
                         byte[] data;
                         if (uri != null) {
                             String mime = context.getContentResolver().getType(uri);
-                            if (!config.optBoolean("images", true)
-                                    || mime == null
-                                    || !mime.startsWith("image/")) return;
+                            if (mime == null || !mime.startsWith("image/")) return;
                             try (InputStream in =
                                     context.getContentResolver().openInputStream(uri)) {
-                                data = bounded(in, imageLimit());
+                                data = bounded(in, ClippWire.MAX_IMAGE_BYTES);
                             }
                             BitmapFactory.Options info = new BitmapFactory.Options();
                             info.inJustDecodeBounds = true;
@@ -400,7 +408,8 @@ public final class ClippEngine implements AutoCloseable {
                                 Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
                                 if (bitmap == null) return;
                                 try {
-                                    LimitedOutput out = new LimitedOutput(imageLimit());
+                                    LimitedOutput out =
+                                            new LimitedOutput(ClippWire.MAX_IMAGE_BYTES);
                                     if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out))
                                         return;
                                     data = out.toByteArray();
@@ -416,7 +425,7 @@ public final class ClippEngine implements AutoCloseable {
                                             mime,
                                             "clipp." + (format == ClippWire.PNG ? "png" : "jpg"));
                         } else {
-                            if (!config.optBoolean("text", true) || first.getText() == null) return;
+                            if (first.getText() == null) return;
                             String text =
                                     first.getText()
                                             .toString()
@@ -428,11 +437,11 @@ public final class ClippEngine implements AutoCloseable {
                             item = ClippPayload.text(text);
                         }
                         if (item.key.equals(current)) return;
-                        current = item.key;
-                        latest = item;
                         SharedPreferences prefs = context.getSharedPreferences("clipp_local", 0);
                         long sequence = prefs.getLong("sequence", 0) + 1;
-                        if (!prefs.edit().putLong("sequence", sequence).commit()) return;
+                        if (!prefs.edit().putLong("sequence", sequence).commit())
+                            throw new IOException("Sequence persistence failed");
+                        current = item.key;
                         localItem =
                                 ClippWire.local(
                                         data,
@@ -446,7 +455,7 @@ public final class ClippEngine implements AutoCloseable {
                         ClippTransport active = transport;
                         if (active != null) active.publish(localItem);
                     } catch (Exception e) {
-                        status("network", "connection_error");
+                        android.util.Log.w("ClippEngine", "Clipboard operation failed", e);
                     }
                 });
     }
@@ -483,7 +492,10 @@ public final class ClippEngine implements AutoCloseable {
         }
     }
 
-    private void apply(ClippPayload item, int epoch) throws Exception {
+    private void apply(ClippPayload item, int epoch, boolean suppressOverlay) throws Exception {
+        // USER_PRESENT follows dismissal of the keyguard. Check its visual state rather
+        // than the separately updated TrustManager device-lock state.
+        if (context.getSystemService(KeyguardManager.class).isKeyguardLocked()) return;
         ClipData clip;
         if (item.image == null) clip = ClipData.newPlainText("Clipp", item.text);
         else {
@@ -492,7 +504,8 @@ public final class ClippEngine implements AutoCloseable {
                 throw new IOException("Image directory unavailable");
             String name = hash(item.image).toLowerCase(Locale.ROOT) + "." + extension(item.mime);
             File file = new File(dir, name);
-            File[] files = dir.listFiles();
+            File[] files =
+                    dir.listFiles(cached -> cached.isFile() && !cached.getName().endsWith(".tmp"));
             long used = 0;
             if (files != null)
                 for (File old : files) {
@@ -536,6 +549,8 @@ public final class ClippEngine implements AutoCloseable {
         }
         PersistableBundle marker = new PersistableBundle();
         marker.putBoolean("org.evolution.clipp.received", true);
+        if (suppressOverlay)
+            marker.putBoolean("com.android.systemui.SUPPRESS_CLIPBOARD_OVERLAY", true);
         clip.getDescription().setExtras(marker);
         long revision = localRevision.get();
         main.post(
@@ -545,25 +560,23 @@ public final class ClippEngine implements AutoCloseable {
                             && epoch == generation
                             && item.key.equals(current)
                             && revision == localRevision.get()) {
-                        if (context.getSystemService(KeyguardManager.class).isDeviceLocked()) {
-                            deferred = item;
+                        if (context.getSystemService(KeyguardManager.class).isKeyguardLocked())
                             return;
-                        }
                         try {
                             clipboard.setPrimaryClip(clip);
-                            deferred = null;
+                            if (deferred == item) deferred = null;
                             publishedImage =
                                     item.image == null
                                             ? ""
                                             : clip.getItemAt(0).getUri().getLastPathSegment();
                         } catch (RuntimeException e) {
+                            android.util.Log.w("ClippEngine", "Clipboard update failed", e);
                             enqueue(
                                     () -> {
                                         if (!closed
                                                 && epoch == generation
                                                 && item.key.equals(current)) {
                                             current = "";
-                                            status("network", "connection_error");
                                         }
                                     });
                         }
@@ -590,19 +603,20 @@ public final class ClippEngine implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
-        enabled = false;
-        generation++;
-        ClippTransport t = transport;
-        transport = null;
-        if (t != null) t.close();
-        if (graceTimer != null) graceTimer.cancel(false);
+        synchronized (networkLifecycle) {
+            if (closed) return;
+            closed = true;
+            enabled = false;
+            generation++;
+            ClippTransport t = transport;
+            transport = null;
+            if (t != null) t.close();
+        }
         worker.shutdownNow();
         clipboard.removePrimaryClipChangedListener(clips);
         connectivity.unregisterNetworkCallback(networks);
         context.getContentResolver().unregisterContentObserver(observer);
         context.unregisterReceiver(screen);
-        latest = null;
         localItem = null;
         deferred = null;
     }
