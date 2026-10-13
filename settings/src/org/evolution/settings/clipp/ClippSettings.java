@@ -3,26 +3,37 @@
 package org.evolution.settings.clipp;
 
 import android.app.AlertDialog;
-import android.content.*;
+import android.content.Context;
+import android.content.Intent;
 import android.database.ContentObserver;
-import android.os.*;
-import android.text.*;
-import android.text.method.LinkMovementMethod;
-import android.text.style.URLSpan;
-import android.widget.*;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
 
-import androidx.preference.*;
+import androidx.preference.Preference;
+import androidx.preference.PreferenceCategory;
+import androidx.preference.PreferenceGroup;
+import androidx.preference.PreferenceScreen;
+import androidx.preference.SwitchPreferenceCompat;
 
 import com.android.settings.R;
 import com.android.settings.SettingsPreferenceFragment;
+import com.android.settingslib.widget.FooterPreference;
 
 import org.evolution.clipp.ClippContract;
-import org.json.*;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 public final class ClippSettings extends SettingsPreferenceFragment {
     private JSONObject config = new JSONObject();
     private final Handler main = new Handler(Looper.getMainLooper());
-    private boolean resumed, preparing;
+    private boolean preparing;
     private final ContentObserver observer =
             new ContentObserver(main) {
                 @Override
@@ -54,7 +65,6 @@ public final class ClippSettings extends SettingsPreferenceFragment {
     @Override
     public void onResume() {
         super.onResume();
-        resumed = true;
         getActivity().setTitle(R.string.clipboard_sync_title);
         getContext()
                 .getContentResolver()
@@ -65,7 +75,6 @@ public final class ClippSettings extends SettingsPreferenceFragment {
 
     @Override
     public void onPause() {
-        resumed = false;
         getContext().getContentResolver().unregisterContentObserver(observer);
         super.onPause();
     }
@@ -109,9 +118,11 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         toggle(
                 screen,
                 "enabled",
-                R.string.clipboard_sync_title,
+                R.string.clipboard_sync_enabled,
                 R.string.clipboard_sync_summary,
                 false);
+        PreferenceCategory options = new PreferenceCategory(getContext());
+        screen.addPreference(options);
         Preference group = new Preference(getContext());
         group.setTitle(R.string.clipp_group);
         group.setSummary(
@@ -124,75 +135,27 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                     setup();
                     return true;
                 });
-        screen.addPreference(group);
+        options.addPreference(group);
         if (!config.optString("fingerprint").isEmpty()) {
             Preference fp = new Preference(getContext());
             fp.setTitle(R.string.clipp_fingerprint);
             fp.setSummary(config.optString("fingerprint"));
             fp.setSelectable(false);
-            screen.addPreference(fp);
+            options.addPreference(fp);
         }
-        toggle(screen, "text", R.string.clipboard_sync_text, 0, true);
-        toggle(
-                screen,
-                "images",
-                R.string.clipboard_sync_images,
-                R.string.clipboard_sync_images_summary,
-                true);
-        ListPreference size = new ListPreference(getContext());
-        size.setPersistent(false);
-        size.setTitle(R.string.clipboard_sync_size);
-        size.setEntries(new String[] {"5 MB", "10 MB", "20 MB", "50 MB"});
-        size.setEntryValues(new String[] {"5", "10", "20", "50"});
-        size.setValue(Integer.toString(config.optInt("maxImageMb", 20)));
-        size.setSummaryProvider(ListPreference.SimpleSummaryProvider.getInstance());
-        size.setOnPreferenceChangeListener(
-                (p, v) -> {
-                    try {
-                        change("maxImageMb", Integer.parseInt(v.toString()));
-                        return true;
-                    } catch (Exception e) {
-                        return false;
-                    }
-                });
-        screen.addPreference(size);
-        Preference background = new Preference(getContext());
-        background.setTitle(R.string.clipp_background);
-        background.setSummary(R.string.clipp_background_summary);
-        background.setSelectable(false);
-        screen.addPreference(background);
-        Preference state = new Preference(getContext());
-        state.setKey("network_state");
-        state.setTitle(R.string.clipp_network);
-        state.setSelectable(false);
-        screen.addPreference(state);
         PreferenceCategory devices = new PreferenceCategory(getContext());
         devices.setKey("devices");
         devices.setTitle(R.string.clipboard_sync_servers);
         screen.addPreference(devices);
-        Preference note =
-                new Preference(getContext()) {
-                    @Override
-                    public void onBindViewHolder(PreferenceViewHolder holder) {
-                        super.onBindViewHolder(holder);
-                        TextView text = (TextView) holder.findViewById(android.R.id.summary);
-                        if (text != null) {
-                            text.setMovementMethod(LinkMovementMethod.getInstance());
-                            text.setLinkTextColor(0xff4285f4);
-                        }
-                    }
-                };
-        String description = getString(R.string.clipboard_sync_note);
-        SpannableString link = new SpannableString(description);
-        int start = description.indexOf("Clipp");
-        if (start >= 0)
-            link.setSpan(
-                    new URLSpan("https://github.com/martona/clipp"),
-                    start,
-                    start + 5,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        note.setSummary(link);
-        note.setSelectable(false);
+        FooterPreference note = new FooterPreference(getContext());
+        note.setTitle(R.string.clipboard_sync_note);
+        note.setLearnMoreText(getString(R.string.clipboard_sync_learn_more));
+        note.setLearnMoreAction(
+                v ->
+                        startActivity(
+                                new Intent(
+                                        Intent.ACTION_VIEW,
+                                        Uri.parse("https://github.com/martona/clipp"))));
         screen.addPreference(note);
         updateStates();
     }
@@ -211,12 +174,6 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                 return R.string.clipboard_sync_connected;
             case "connection_error":
                 return R.string.clipboard_sync_transfer_error;
-            case "waiting_wifi":
-                return R.string.clipp_waiting_wifi;
-            case "listening":
-                return R.string.clipp_discovering;
-            case "paused":
-                return R.string.clipp_paused;
             default:
                 return R.string.clipboard_sync_disconnected;
         }
@@ -224,66 +181,24 @@ public final class ClippSettings extends SettingsPreferenceFragment {
 
     private void updateStates() {
         if (getPreferenceScreen() == null) return;
-        Preference network = findPreference("network_state");
-        if (network != null) network.setSummary(stateLabel(status("network")));
         PreferenceCategory category = findPreference("devices");
         if (category == null) return;
         category.removeAll();
         try {
             JSONObject devices = new JSONObject(status("devices"));
             java.util.Iterator<String> ids = devices.keys();
-            int count = 0;
-            while (ids.hasNext() && count++ < 5) {
+            while (ids.hasNext()) {
                 String id = ids.next();
                 JSONObject d = new JSONObject(devices.getString(id));
                 Preference p = new Preference(getContext());
                 p.setTitle(d.optString("name"));
                 p.setSummary(stateLabel(d.optString("state")));
-                p.setOnPreferenceClickListener(
-                        pref -> {
-                            block(id, d.optString("name"));
-                            return true;
-                        });
+                p.setSelectable(false);
                 category.addPreference(p);
             }
         } catch (Exception ignored) {
         }
-        JSONArray blocked = config.optJSONArray("blocked");
-        if (blocked != null && blocked.length() > 0) {
-            Preference restore = new Preference(getContext());
-            restore.setTitle(R.string.clipp_restore);
-            restore.setOnPreferenceClickListener(
-                    p -> {
-                        try {
-                            change("blocked", new JSONArray());
-                            build();
-                        } catch (Exception ignored) {
-                        }
-                        return true;
-                    });
-            category.addPreference(restore);
-        }
-    }
-
-    private void block(String id, String name) {
-        new AlertDialog.Builder(getContext())
-                .setTitle(name)
-                .setMessage(R.string.clipp_block_note)
-                .setNegativeButton(android.R.string.cancel, null)
-                .setPositiveButton(
-                        R.string.clipp_block,
-                        (d, w) -> {
-                            try {
-                                JSONArray list = config.optJSONArray("blocked");
-                                if (list == null) list = new JSONArray();
-                                JSONArray next = new JSONArray(list.toString());
-                                next.put(id);
-                                change("blocked", next);
-                                build();
-                            } catch (Exception ignored) {
-                            }
-                        })
-                .show();
+        category.setVisible(category.getPreferenceCount() > 0);
     }
 
     private void setup() {

@@ -2,30 +2,60 @@
 // SPDX-License-Identifier: Apache-2.0
 package org.evolution.settings.clipp;
 
-import android.content.*;
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.*;
-import android.security.keystore.*;
+import android.os.Binder;
+import android.os.Bundle;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import android.util.Base64;
 
-import org.evolution.clipp.*;
-import org.json.*;
+import org.evolution.clipp.ClippBytes;
+import org.evolution.clipp.ClippContract;
+import org.evolution.clipp.ClippCrypto;
+import org.json.JSONException;
+import org.json.JSONObject;
 
-import java.security.*;
-import java.util.*;
+import java.security.KeyStore;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import javax.crypto.*;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
-/** Private per-user configuration. Argon2 runs in Settings' isolated provider process. */
+/** Private per-user configuration. Argon2 runs in Settings' separate provider process. */
 public final class ClippConfigProvider extends ContentProvider {
     private final ConcurrentHashMap<String, String> states = new ConcurrentHashMap<>();
 
     @Override
     public boolean onCreate() {
+        try {
+            JSONObject saved =
+                    new JSONObject(
+                            getContext()
+                                    .getSharedPreferences("clipp", Context.MODE_PRIVATE)
+                                    .getString("deviceStates", "{}"));
+            java.util.Iterator<String> ids = saved.keys();
+            while (ids.hasNext()) {
+                String id = ids.next();
+                if (id.matches("[a-f0-9]{32}")) states.put(id, saved.getString(id));
+            }
+        } catch (JSONException ignored) {
+        }
         return true;
+    }
+
+    private void persistStates(SharedPreferences prefs) {
+        JSONObject saved = new JSONObject(states);
+        prefs.edit().putString("deviceStates", saved.toString()).apply();
     }
 
     private void enforce(boolean write) {
@@ -97,12 +127,13 @@ public final class ClippConfigProvider extends ContentProvider {
                 Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
                 c.init(Cipher.ENCRYPT_MODE, key());
                 byte[] encrypted = c.doFinal(root);
-                byte[] fingerprint = ClippCrypto.call(13, ClippCrypto.role(root, 4), null, null);
+                byte[] fingerprint = ClippCrypto.fingerprint(root);
                 Arrays.fill(root, (byte) 0);
-                StringBuilder fp = new StringBuilder();
+                String fingerprintHex = ClippBytes.hex(fingerprint);
+                StringBuilder fp = new StringBuilder(35);
                 for (int i = 0; i < fingerprint.length; i++) {
                     if (i > 0 && i % 4 == 0) fp.append('-');
-                    fp.append(String.format(Locale.ROOT, "%02x", fingerprint[i] & 255));
+                    fp.append(fingerprintHex, i * 2, i * 2 + 2);
                 }
                 config.put("group", group).put("fingerprint", fp.toString()).put("enabled", false);
                 if (!prefs.edit()
@@ -111,23 +142,18 @@ public final class ClippConfigProvider extends ContentProvider {
                         .putString("iv", Base64.encodeToString(c.getIV(), Base64.NO_WRAP))
                         .commit()) throw new IllegalStateException();
                 states.clear();
+                persistStates(prefs);
                 getContext().getContentResolver().notifyChange(ClippContract.CONFIG, null);
             } else if (method.equals("save")) {
                 JSONObject next = new JSONObject(extras.getString("config"));
                 next.remove("root");
-                if (next.toString().length() > 32768
-                        || !Arrays.asList(5, 10, 20, 50).contains(next.optInt("maxImageMb", 20)))
-                    throw new IllegalArgumentException("Config");
+                next.remove("text");
+                next.remove("images");
+                next.remove("maxImageMb");
+                if (next.toString().length() > 32768) throw new IllegalArgumentException("Config");
                 next.put("hostId", config.optString("hostId"))
                         .put("group", config.optString("group"))
                         .put("fingerprint", config.optString("fingerprint"));
-                JSONArray blocked = next.optJSONArray("blocked");
-                if (blocked != null && blocked.length() > 32)
-                    throw new IllegalArgumentException("Devices");
-                if (blocked != null)
-                    for (int i = 0; i < blocked.length(); i++)
-                        if (!blocked.getString(i).matches("[a-f0-9]{32}"))
-                            throw new IllegalArgumentException("Device");
                 if (next.optBoolean("enabled") && prefs.getString("root", "").isEmpty())
                     throw new IllegalArgumentException("Group missing");
                 if (!prefs.edit().putString("config", next.toString()).commit())
@@ -147,14 +173,16 @@ public final class ClippConfigProvider extends ContentProvider {
                     String value = extras.getString("status", "");
                     if ("devices".equals(arg)) {
                         states.keySet().removeIf(id -> id.matches("[a-f0-9]{32}"));
+                        persistStates(prefs);
                         getContext().getContentResolver().notifyChange(ClippContract.STATUS, null);
                         return result;
                     }
                     if (value.length() > 2048) throw new IllegalArgumentException();
-                    if (states.size() > 40 && !states.containsKey(arg)) return result;
                     String old = states.put(arg, value);
-                    if (!value.equals(old))
+                    if (!value.equals(old)) {
+                        persistStates(prefs);
                         getContext().getContentResolver().notifyChange(ClippContract.STATUS, null);
+                    }
                 }
             } else throw new IllegalArgumentException("Method");
             return result;
