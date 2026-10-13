@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -79,6 +80,12 @@ public final class ClippTransport implements AutoCloseable {
     private final Set<String> resolvingNames = new HashSet<>();
     private final Set<String> discoveredNames = new HashSet<>();
     private boolean resolving;
+    // Main-thread only: successive transports wait for the previous NSD lifecycle to end.
+    private static CompletableFuture<Void> previousStop = CompletableFuture.completedFuture(null);
+    private final CompletableFuture<Void> advertisementStopped = new CompletableFuture<>();
+    private final CompletableFuture<Void> discoveryStopped = new CompletableFuture<>();
+    private final CompletableFuture<Void> resourcesStopped = new CompletableFuture<>();
+    private final AtomicBoolean closeRequested = new AtomicBoolean();
     private volatile boolean closed;
     private volatile ClippWire.Item latest;
     private ServerSocket listener;
@@ -223,7 +230,6 @@ public final class ClippTransport implements AutoCloseable {
     }
 
     public void start() {
-        readers.execute(this::acceptLoop);
         main.post(this::startDiscovery);
     }
 
@@ -497,8 +503,13 @@ public final class ClippTransport implements AutoCloseable {
     }
 
     private void startDiscovery() {
-        if (closed) return;
+        if (closed || closeRequested.get()) return;
+        if (!previousStop.isDone()) {
+            previousStop.thenRun(() -> main.post(this::startDiscovery));
+            return;
+        }
         try {
+            readers.execute(this::acceptLoop);
             NsdServiceInfo info = new NsdServiceInfo();
             info.setServiceName(
                     "clipp-"
@@ -519,26 +530,40 @@ public final class ClippTransport implements AutoCloseable {
                     new NsdManager.RegistrationListener() {
                         public void onServiceRegistered(NsdServiceInfo i) {}
 
-                        public void onServiceUnregistered(NsdServiceInfo i) {}
+                        public void onServiceUnregistered(NsdServiceInfo i) {
+                            advertisementStopped.complete(null);
+                        }
 
                         public void onRegistrationFailed(NsdServiceInfo i, int e) {
                             android.util.Log.w("ClippTransport", "mDNS registration failed: " + e);
+                            advertisementStopped.complete(null);
                         }
 
-                        public void onUnregistrationFailed(NsdServiceInfo i, int e) {}
+                        public void onUnregistrationFailed(NsdServiceInfo i, int e) {
+                            android.util.Log.w(
+                                    "ClippTransport", "mDNS unregistration failed: " + e);
+                            advertisementStopped.complete(null);
+                        }
                     };
             nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registration);
             discovery =
                     new NsdManager.DiscoveryListener() {
                         public void onDiscoveryStarted(String t) {}
 
-                        public void onDiscoveryStopped(String t) {}
+                        public void onDiscoveryStopped(String t) {
+                            discoveryStopped.complete(null);
+                        }
 
                         public void onStartDiscoveryFailed(String t, int e) {
                             android.util.Log.w("ClippTransport", "mDNS discovery failed: " + e);
+                            discoveryStopped.complete(null);
                         }
 
-                        public void onStopDiscoveryFailed(String t, int e) {}
+                        public void onStopDiscoveryFailed(String t, int e) {
+                            android.util.Log.w(
+                                    "ClippTransport", "mDNS discovery stop failed: " + e);
+                            discoveryStopped.complete(null);
+                        }
 
                         public void onServiceFound(NsdServiceInfo service) {
                             main.post(
@@ -751,8 +776,9 @@ public final class ClippTransport implements AutoCloseable {
                 nsd.unregisterService(previous);
             } catch (Exception error) {
                 android.util.Log.w("ClippTransport", "mDNS withdrawal failed", error);
+                advertisementStopped.complete(null);
             }
-        }
+        } else advertisementStopped.complete(null);
         if (discovery != null) {
             NsdManager.DiscoveryListener previous = discovery;
             discovery = null;
@@ -760,18 +786,27 @@ public final class ClippTransport implements AutoCloseable {
                 nsd.stopServiceDiscovery(previous);
             } catch (Exception error) {
                 android.util.Log.w("ClippTransport", "mDNS discovery stop failed", error);
+                discoveryStopped.complete(null);
             }
-        }
+        } else discoveryStopped.complete(null);
     }
 
     @Override
     public void close() {
+        // Main-thread callers (including deep Doze) may finish an already queued stop now.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            closeRequested.set(true);
+            closeOnMain();
+        } else if (closeRequested.compareAndSet(false, true)) main.post(this::closeOnMain);
+    }
+
+    private void closeOnMain() {
         if (closed) return;
+        previousStop =
+                CompletableFuture.allOf(
+                        previousStop, advertisementStopped, discoveryStopped, resourcesStopped);
+        stopDiscoveryAndAdvertising();
         closed = true;
-        // Deep-Doze broadcasts run on main. Withdraw the advertisement in this same
-        // dispatch, before socket teardown; an extra post can be delayed by suspension.
-        if (Looper.myLooper() == Looper.getMainLooper()) stopDiscoveryAndAdvertising();
-        else main.post(this::stopDiscoveryAndAdvertising);
         try {
             listener.close();
         } catch (IOException ignored) {
@@ -793,5 +828,6 @@ public final class ClippTransport implements AutoCloseable {
         Arrays.fill(root, (byte) 0);
         Arrays.fill(mdnsKey, (byte) 0);
         latest = null;
+        resourcesStopped.complete(null);
     }
 }
