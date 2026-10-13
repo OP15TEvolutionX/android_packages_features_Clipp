@@ -1,0 +1,7 @@
+<manifest>
+  <remote name="op15t-evo" fetch="https://github.com/OP15TEvolutionX/" />
+  <project path="packages/features/Clipp" name="android_packages_features_Clipp"
+           remote="op15t-evo" revision="cnb">
+    <linkfile src="settings/res" dest="packages/apps/Settings/clipp-res" />
+  </project>
+</manifest>

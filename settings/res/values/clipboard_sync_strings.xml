@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+  <string name="clipboard_sync_title">Clipboard</string>
+  <string name="clipboard_sync_summary">Share text and images with your devices</string>
+  <string name="clipboard_sync_text">Sync text</string>
+  <string name="clipboard_sync_images">Sync images</string>
+  <string name="clipboard_sync_images_summary">Place received images in the system clipboard</string>
+  <string name="clipboard_sync_size">Maximum image size</string>
+  <string name="clipboard_sync_servers">Computers</string>
+  <string name="clipboard_sync_note">Your devices must be on the same Wi-Fi network and have Clipp installed. Use the same group name and passphrase. Up to five computers can connect simultaneously.</string>
+  <string name="clipboard_sync_connected">Connected</string>
+  <string name="clipboard_sync_transfer_error">Connection error</string>
+  <string name="clipboard_sync_invalid">Connection error</string>
+  <string name="clipboard_sync_save">Save</string>
+  <string name="clipboard_sync_disconnected">Disconnected</string>
+  <string name="clipp_group">Clipp group</string>
+  <string name="clipp_password">Passphrase</string>
+  <string name="clipp_setup_required">Set up a Clipp group first</string>
+  <string name="clipp_preparing">Preparing group…</string>
+  <string name="clipp_fingerprint">Group fingerprint</string>
+  <string name="clipp_background">Background connection</string>
+  <string name="clipp_background_summary">Connections and discovery stop five minutes after the screen turns off. Unlocking restores them immediately.</string>
+  <string name="clipp_network">Connection status</string>
+  <string name="clipp_waiting_wifi">Waiting for Wi-Fi</string>
+  <string name="clipp_discovering">Discovering your devices</string>
+  <string name="clipp_paused">Paused</string>
+  <string name="clipp_restore">Allow blocked devices again</string>
+  <string name="clipp_block">Block device</string>
+  <string name="clipp_block_note">Block this device on the phone. Other devices in the same group can still exchange clipboard content.</string>
+  <string name="clipp_group_note">Use the same group name and passphrase in Clipp on your computers. At least 8 characters. All devices in the group trust each other.</string>
+  <string name="clipp_ready">Group configured. Enable clipboard sync to connect.</string>
+</resources>

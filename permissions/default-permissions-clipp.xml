@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 Evolution X. SPDX-License-Identifier: Apache-2.0 -->
+<exceptions>
+    <exception package="com.android.systemui">
+        <permission name="android.permission.ACCESS_LOCAL_NETWORK" fixed="true" />
+    </exception>
+</exceptions>

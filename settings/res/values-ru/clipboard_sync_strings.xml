@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+  <string name="clipboard_sync_title">Буфер обмена</string>
+  <string name="clipboard_sync_summary">Обмен текстом и изображениями с вашими устройствами</string>
+  <string name="clipboard_sync_text">Синхронизировать текст</string>
+  <string name="clipboard_sync_images">Синхронизировать изображения</string>
+  <string name="clipboard_sync_images_summary">Помещать полученные изображения в системный буфер</string>
+  <string name="clipboard_sync_size">Максимальный размер изображения</string>
+  <string name="clipboard_sync_servers">Компьютеры</string>
+  <string name="clipboard_sync_note">Для работы устройства должны находиться в одной сети Wi-Fi и должен быть установлен Clipp. Укажите одинаковые имя группы и парольную фразу. Можно подключить до пяти компьютеров одновременно.</string>
+  <string name="clipboard_sync_connected">Подключено</string>
+  <string name="clipboard_sync_transfer_error">Ошибка подключения</string>
+  <string name="clipboard_sync_invalid">Ошибка подключения</string>
+  <string name="clipboard_sync_save">Сохранить</string>
+  <string name="clipboard_sync_disconnected">Не подключено</string>
+  <string name="clipp_group">Группа Clipp</string>
+  <string name="clipp_password">Парольная фраза</string>
+  <string name="clipp_setup_required">Сначала настройте группу Clipp</string>
+  <string name="clipp_preparing">Подготовка группы…</string>
+  <string name="clipp_fingerprint">Отпечаток группы</string>
+  <string name="clipp_background">Подключение в фоне</string>
+  <string name="clipp_background_summary">Соединения и поиск устройств прекращаются через пять минут после выключения экрана. После разблокировки подключение восстанавливается.</string>
+  <string name="clipp_network">Статус подключения</string>
+  <string name="clipp_waiting_wifi">Ожидание Wi-Fi</string>
+  <string name="clipp_discovering">Поиск ваших устройств</string>
+  <string name="clipp_paused">Приостановлено</string>
+  <string name="clipp_restore">Снова разрешить заблокированные устройства</string>
+  <string name="clipp_block">Заблокировать устройство</string>
+  <string name="clipp_block_note">Устройство будет заблокировано на телефоне. Другие устройства в этой группе смогут продолжать обмен буфером.</string>
+  <string name="clipp_group_note">Укажите те же имя группы и парольную фразу, что и в Clipp на компьютерах. Не менее 8 символов. Все устройства группы доверяют друг другу.</string>
+  <string name="clipp_ready">Группа настроена. Включите обмен буфером для подключения.</string>
+</resources>

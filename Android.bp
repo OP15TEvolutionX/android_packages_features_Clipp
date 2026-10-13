@@ -1,0 +1,58 @@
+// Copyright (C) 2026 Evolution X
+// SPDX-License-Identifier: Apache-2.0
+package { default_applicable_licenses: ["evolution_clipp_license"], }
+license {
+    name: "evolution_clipp_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-Apache-2.0", "SPDX-license-identifier-MIT", "SPDX-license-identifier-BSD", "SPDX-license-identifier-ISC"],
+    license_text: ["LICENSE", "LICENSE.clipp", "third_party/libsodium/LICENSE", "third_party/zstd/LICENSE", "third_party/xxhash/LICENSE"],
+}
+filegroup {
+    name: "evolution-clipp-systemui-srcs",
+    srcs: ["common/src/**/*.java", "systemui/src/**/*.java", "systemui/src/**/*.kt"],
+    visibility: ["//frameworks/base/packages/SystemUI:__pkg__"],
+}
+filegroup {
+    name: "evolution-clipp-settings-srcs",
+    srcs: ["common/src/**/*.java", "settings/src/**/*.java"],
+    visibility: ["//packages/apps/Settings:__pkg__"],
+}
+cc_library_static {
+    name: "libevolution_clipp_sodium",
+    host_supported: true,
+    compile_multilib: "64",
+    srcs: ["third_party/libsodium/**/*.c"],
+    local_include_dirs: ["third_party/libsodium/include", "third_party/libsodium/include/sodium"],
+    export_include_dirs: ["third_party/libsodium/include"],
+    cflags: ["-include packages/features/Clipp/native/sodium_config.h", "-Wno-error", "-Wno-unused-function"],
+}
+cc_library_static {
+    name: "libevolution_clipp_zstd",
+    host_supported: true,
+    compile_multilib: "64",
+    srcs: ["third_party/zstd/common/*.c", "third_party/zstd/decompress/*.c"],
+    local_include_dirs: ["third_party/zstd", "third_party/zstd/common"],
+    export_include_dirs: ["third_party/zstd"],
+    cflags: ["-DZSTD_DISABLE_ASM", "-Wno-error"],
+}
+cc_library_shared {
+    name: "libevolution_clipp_jni",
+    required: ["clipp-default-permissions"],
+    host_supported: true,
+    compile_multilib: "64",
+    srcs: ["native/crypto.cpp", "native/xxhash.c"],
+    local_include_dirs: ["third_party/xxhash"],
+    header_libs: ["jni_headers"],
+    static_libs: ["libevolution_clipp_sodium", "libevolution_clipp_zstd"],
+    cppflags: ["-fexceptions"],
+    cflags: ["-DXXH_STATIC_LINKING_ONLY"],
+    stl: "libc++_static",
+}
+
+prebuilt_etc {
+    name: "clipp-default-permissions",
+    src: "permissions/default-permissions-clipp.xml",
+    filename: "default-permissions-clipp.xml",
+    sub_dir: "default-permissions",
+    system_ext_specific: true,
+}
