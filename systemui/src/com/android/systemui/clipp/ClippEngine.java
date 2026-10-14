@@ -59,6 +59,7 @@ public final class ClippEngine implements AutoCloseable {
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private volatile ClippTransport transport;
     private volatile boolean closed, enabled;
+    private volatile boolean showPreview = true;
     private volatile int generation;
     private JSONObject config = new JSONObject();
     private String runtimeKey = "";
@@ -179,6 +180,11 @@ public final class ClippEngine implements AutoCloseable {
     private void reloadOnWorker() {
         try {
             JSONObject next = ClippContract.read(context.getContentResolver());
+            showPreview = next.optBoolean("showPreview", true);
+            // Presentation changes must not restart peer connections.
+            JSONObject connectionConfig = new JSONObject(next.toString());
+            connectionConfig.remove("showPreview");
+            config = next;
             Network wifi = null;
             for (Network n : connectivity.getAllNetworks()) {
                 NetworkCapabilities caps = connectivity.getNetworkCapabilities(n);
@@ -192,7 +198,7 @@ public final class ClippEngine implements AutoCloseable {
                             && context.getSystemService(UserManager.class).isUserUnlocked()
                             && !context.getSystemService(PowerManager.class).isDeviceIdleMode();
             String key =
-                    next.toString()
+                    connectionConfig.toString()
                             + ":"
                             + wifi
                             + ":"
@@ -201,7 +207,6 @@ public final class ClippEngine implements AutoCloseable {
                             + active;
             if (key.equals(runtimeKey)) return;
             runtimeKey = key;
-            config = next;
             generation++;
             enabled = active;
             ClippTransport old = transport;
@@ -549,7 +554,7 @@ public final class ClippEngine implements AutoCloseable {
         }
         PersistableBundle marker = new PersistableBundle();
         marker.putBoolean("org.evolution.clipp.received", true);
-        if (suppressOverlay)
+        if (suppressOverlay || !showPreview)
             marker.putBoolean("com.android.systemui.SUPPRESS_CLIPBOARD_OVERLAY", true);
         clip.getDescription().setExtras(marker);
         long revision = localRevision.get();

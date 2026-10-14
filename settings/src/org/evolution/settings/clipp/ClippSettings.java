@@ -98,6 +98,10 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                 (pref, value) -> {
                     try {
                         change(key, value);
+                        if ("enabled".equals(key)) {
+                            Preference preview = findPreference("showPreview");
+                            if (preview != null) preview.setEnabled((Boolean) value);
+                        }
                         return true;
                     } catch (Exception e) {
                         Toast.makeText(
@@ -121,6 +125,13 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                 R.string.clipboard_sync_enabled,
                 R.string.clipboard_sync_summary,
                 false);
+        toggle(
+                screen,
+                "showPreview",
+                R.string.clipboard_sync_show_preview,
+                R.string.clipboard_sync_show_preview_summary,
+                true);
+        findPreference("showPreview").setEnabled(config.optBoolean("enabled"));
         PreferenceCategory options = new PreferenceCategory(getContext());
         screen.addPreference(options);
         Preference group = new Preference(getContext());

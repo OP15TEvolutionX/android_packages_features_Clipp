@@ -18,4 +18,6 @@
   <string name="clipp_group_note">Укажите те же имя группы и парольную фразу, что и в Clipp на компьютерах. Не менее 8 символов. Все устройства группы доверяют друг другу.</string>
   <string name="clipp_ready">Группа настроена. Включите обмен буфером для подключения.</string>
   <string name="clipboard_sync_learn_more">Подробнее о настройке синхронизации буфера обмена...</string>
+  <string name="clipboard_sync_show_preview">Показывать предпросмотр</string>
+  <string name="clipboard_sync_show_preview_summary">Показывает текст и изображения, полученные с других устройств, во всплывающей панели</string>
 </resources>

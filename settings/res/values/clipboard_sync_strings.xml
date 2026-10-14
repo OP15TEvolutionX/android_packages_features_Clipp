@@ -18,4 +18,6 @@
   <string name="clipp_group_note">Use the same group name and passphrase in Clipp on your computers. At least 8 characters. All devices in the group trust each other.</string>
   <string name="clipp_ready">Group configured. Enable clipboard sync to connect.</string>
   <string name="clipboard_sync_learn_more">Learn more about setting up clipboard sync...</string>
+  <string name="clipboard_sync_show_preview">Show preview</string>
+  <string name="clipboard_sync_show_preview_summary">Shows text and images received from other devices in a pop-up panel</string>
 </resources>
