@@ -47,6 +47,7 @@ import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -77,21 +78,50 @@ public final class ClippEngine implements AutoCloseable {
                     reload();
                 }
             };
+    private ScheduledFuture<?> pendingReload;
+    private final Object reloadLock = new Object();
     private final ConnectivityManager.NetworkCallback networks =
             new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(Network n) {
-                    reload();
+                    reloadDebounced(1000);
                 }
 
                 @Override
                 public void onLost(Network n) {
-                    reload();
+                    reloadDebounced(1000);
+                }
+
+                @Override
+                public void onCapabilitiesChanged(Network n, NetworkCapabilities c) {
+                    reloadDebounced(1000);
                 }
 
                 @Override
                 public void onLinkPropertiesChanged(Network n, LinkProperties p) {
-                    reload();
+                    reloadDebounced(1000);
+                }
+            };
+    private final ConnectivityManager.NetworkCallback vpnNetworks =
+            new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network n) {
+                    reloadDebounced(1000);
+                }
+
+                @Override
+                public void onLost(Network n) {
+                    reloadDebounced(1000);
+                }
+
+                @Override
+                public void onCapabilitiesChanged(Network n, NetworkCapabilities c) {
+                    reloadDebounced(1000);
+                }
+
+                @Override
+                public void onLinkPropertiesChanged(Network n, LinkProperties p) {
+                    reloadDebounced(1000);
                 }
             };
     private final BroadcastReceiver screen =
@@ -147,6 +177,17 @@ public final class ClippEngine implements AutoCloseable {
                         .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                         .build(),
                 networks);
+        try {
+            connectivity.registerNetworkCallback(
+                    new NetworkRequest.Builder()
+                            .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                            .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build(),
+                    vpnNetworks);
+        } catch (Exception e) {
+            android.util.Log.w("ClippEngine", "Failed to register VPN network callback", e);
+        }
         IntentFilter filter = new IntentFilter();
         filter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
         filter.addAction(Intent.ACTION_USER_PRESENT);
@@ -173,7 +214,26 @@ public final class ClippEngine implements AutoCloseable {
     }
 
     private void reload() {
+        synchronized (reloadLock) {
+            if (pendingReload != null && !pendingReload.isDone()) {
+                pendingReload.cancel(false);
+            }
+        }
         enqueue(this::reloadOnWorker);
+    }
+
+    private void reloadDebounced(long delayMs) {
+        if (closed) return;
+        synchronized (reloadLock) {
+            if (pendingReload != null && !pendingReload.isDone()) {
+                pendingReload.cancel(false);
+            }
+            try {
+                pendingReload =
+                        worker.schedule(this::reloadOnWorker, delayMs, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException ignored) {
+            }
+        }
     }
 
     /** Configuration and clipboard state are confined to the worker thread. */
@@ -186,11 +246,16 @@ public final class ClippEngine implements AutoCloseable {
             connectionConfig.remove("showPreview");
             config = next;
             Network wifi = null;
+            Network vpn = null;
             for (Network n : connectivity.getAllNetworks()) {
                 NetworkCapabilities caps = connectivity.getNetworkCapabilities(n);
-                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    wifi = n;
-                    break;
+                if (caps != null) {
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        wifi = n;
+                    }
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                        vpn = n;
+                    }
                 }
             }
             boolean active =
@@ -203,6 +268,10 @@ public final class ClippEngine implements AutoCloseable {
                             + wifi
                             + ":"
                             + (wifi == null ? "" : connectivity.getLinkProperties(wifi))
+                            + ":"
+                            + vpn
+                            + ":"
+                            + (vpn == null ? "" : connectivity.getLinkProperties(vpn))
                             + ":"
                             + active;
             if (key.equals(runtimeKey)) return;
@@ -619,7 +688,14 @@ public final class ClippEngine implements AutoCloseable {
         }
         worker.shutdownNow();
         clipboard.removePrimaryClipChangedListener(clips);
-        connectivity.unregisterNetworkCallback(networks);
+        try {
+            connectivity.unregisterNetworkCallback(networks);
+        } catch (Exception ignored) {
+        }
+        try {
+            connectivity.unregisterNetworkCallback(vpnNetworks);
+        } catch (Exception ignored) {
+        }
         context.getContentResolver().unregisterContentObserver(observer);
         context.unregisterReceiver(screen);
         localItem = null;
