@@ -1,0 +1,33 @@
+#pragma once
+#define CONFIGURED 1
+#define NATIVE_LITTLE_ENDIAN 1
+#define HAVE_STDINT_H 1
+#define HAVE_PTHREAD 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_MMAP 1
+#define HAVE_MLOCK 1
+#define HAVE_MADVISE 1
+#define HAVE_MPROTECT 1
+#define HAVE_SYSCONF 1
+#define HAVE_POSIX_MEMALIGN 1
+#define HAVE_NANOSLEEP 1
+#define HAVE_CLOCK_GETTIME 1
+#define HAVE_GETPID 1
+#define HAVE_CATCHABLE_SEGV 1
+#define HAVE_CATCHABLE_ABRT 1
+#define HAVE_RAISE 1
+#define HAVE_ATOMIC_OPS 1
+#define HAVE_GCC_MEMORY_FENCES 1
+#define HAVE_STDATOMIC_H 1
+#define HAVE_ALLOCA_H 1
+#define HAVE_ALLOCA 1
+#define HAVE_WEAK_SYMBOLS 1
+#define TLS _Thread_local
+#define SODIUM_STATIC 1
+#ifdef __ANDROID__
+#define HAVE_SYS_RANDOM_H 1
+#define HAVE_GETRANDOM 1
+#endif
+#ifdef __SIZEOF_INT128__
+#define HAVE_TI_MODE 1
+#endif

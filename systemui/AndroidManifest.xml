@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.systemui">
+    <uses-permission android:name="android.permission.SUBSTITUTE_SHARE_TARGET_APP_NAME_AND_ICON" />
+    <application>
+        <activity
+            android:name="com.android.systemui.clipp.ShareImageActivity"
+            android:label="@string/clipp_share_copy"
+            android:icon="@drawable/ic_clipp_share"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name="com.android.systemui.clipp.ShareImageService"
+            android:process=":clippshare"
+            android:exported="false" />
+    </application>
+</manifest>

@@ -1,0 +1,2 @@
+# Preserve upstream source formatting.
+third_party/** -whitespace
