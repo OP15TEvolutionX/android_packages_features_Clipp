@@ -60,7 +60,8 @@ public final class ClippEngine implements AutoCloseable {
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private volatile ClippTransport transport;
     private volatile boolean closed, enabled;
-    private volatile boolean showPreview = true;
+    private volatile boolean showImagePreview = true;
+    private volatile boolean showTextPreview = true;
     private volatile int generation;
     private JSONObject config = new JSONObject();
     private String runtimeKey = "";
@@ -240,10 +241,15 @@ public final class ClippEngine implements AutoCloseable {
     private void reloadOnWorker() {
         try {
             JSONObject next = ClippContract.read(context.getContentResolver());
-            showPreview = next.optBoolean("showPreview", true);
+            // The single "showPreview" switch predates the split and seeds both.
+            boolean legacyPreview = next.optBoolean("showPreview", true);
+            showImagePreview = next.optBoolean("showImagePreview", legacyPreview);
+            showTextPreview = next.optBoolean("showTextPreview", legacyPreview);
             // Presentation changes must not restart peer connections.
             JSONObject connectionConfig = new JSONObject(next.toString());
             connectionConfig.remove("showPreview");
+            connectionConfig.remove("showImagePreview");
+            connectionConfig.remove("showTextPreview");
             config = next;
             Network wifi = null;
             Network vpn = null;
@@ -623,7 +629,7 @@ public final class ClippEngine implements AutoCloseable {
         }
         PersistableBundle marker = new PersistableBundle();
         marker.putBoolean("org.evolution.clipp.received", true);
-        if (suppressOverlay || !showPreview)
+        if (suppressOverlay || !(item.image == null ? showTextPreview : showImagePreview))
             marker.putBoolean("com.android.systemui.SUPPRESS_CLIPBOARD_OVERLAY", true);
         clip.getDescription().setExtras(marker);
         long revision = localRevision.get();

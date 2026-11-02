@@ -31,6 +31,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 public final class ClippSettings extends SettingsPreferenceFragment {
+    private static final String[] PREVIEW_KEYS = {"showImagePreview", "showTextPreview"};
     private JSONObject config = new JSONObject();
     private final Handler main = new Handler(Looper.getMainLooper());
     private boolean preparing;
@@ -99,8 +100,10 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                     try {
                         change(key, value);
                         if ("enabled".equals(key)) {
-                            Preference preview = findPreference("showPreview");
-                            if (preview != null) preview.setEnabled((Boolean) value);
+                            for (String preview : PREVIEW_KEYS) {
+                                Preference pref = findPreference(preview);
+                                if (pref != null) pref.setEnabled((Boolean) value);
+                            }
                         }
                         return true;
                     } catch (Exception e) {
@@ -125,13 +128,23 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                 R.string.clipboard_sync_enabled,
                 R.string.clipboard_sync_summary,
                 false);
+        // The single "showPreview" switch predates the split and seeds both.
+        boolean legacyPreview = config.optBoolean("showPreview", true);
         toggle(
                 screen,
-                "showPreview",
-                R.string.clipboard_sync_show_preview,
-                R.string.clipboard_sync_show_preview_summary,
-                true);
-        findPreference("showPreview").setEnabled(config.optBoolean("enabled"));
+                "showImagePreview",
+                R.string.clipboard_sync_show_image_preview,
+                R.string.clipboard_sync_show_image_preview_summary,
+                legacyPreview);
+        toggle(
+                screen,
+                "showTextPreview",
+                R.string.clipboard_sync_show_text_preview,
+                R.string.clipboard_sync_show_text_preview_summary,
+                legacyPreview);
+        for (String preview : PREVIEW_KEYS) {
+            findPreference(preview).setEnabled(config.optBoolean("enabled"));
+        }
         PreferenceCategory options = new PreferenceCategory(getContext());
         screen.addPreference(options);
         Preference group = new Preference(getContext());
