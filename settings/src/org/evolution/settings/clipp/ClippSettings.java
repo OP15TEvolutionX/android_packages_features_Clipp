@@ -101,8 +101,8 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                         change(key, value);
                         if ("enabled".equals(key)) {
                             for (String preview : PREVIEW_KEYS) {
-                                Preference pref = findPreference(preview);
-                                if (pref != null) pref.setEnabled((Boolean) value);
+                                Preference previewPref = findPreference(preview);
+                                if (previewPref != null) previewPref.setEnabled((Boolean) value);
                             }
                         }
                         return true;
