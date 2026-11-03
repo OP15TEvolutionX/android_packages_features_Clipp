@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.view.View;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -25,6 +26,7 @@ import androidx.preference.SwitchPreferenceCompat;
 import com.android.settings.R;
 import com.android.settings.SettingsPreferenceFragment;
 import com.android.settingslib.widget.FooterPreference;
+import com.google.android.material.appbar.AppBarLayout;
 
 import org.evolution.clipp.ClippContract;
 import org.json.JSONException;
@@ -61,6 +63,17 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         super.onCreate(state);
         read();
         build();
+    }
+
+    @Override
+    public void onViewCreated(View view, Bundle state) {
+        super.onViewCreated(view, state);
+        // Open with the large title, like Routines; scrolling the list folds it away.
+        AppBarLayout appBar = requireActivity().findViewById(
+                com.android.settingslib.collapsingtoolbar.R.id.app_bar);
+        if (appBar != null) {
+            appBar.setExpanded(true, false);
+        }
     }
 
     @Override
