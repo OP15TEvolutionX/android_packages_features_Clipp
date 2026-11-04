@@ -11,7 +11,10 @@ import android.widget.Toast;
 
 import com.android.systemui.res.R;
 
-/** NoDisplay share target. Delegate the temporary URI grant before finishing. */
+/**
+ * Invisible "Copy" share target for images. Hands the image URI and its read grant to
+ * {@link ShareImageService} and finishes.
+ */
 public final class ShareImageActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {

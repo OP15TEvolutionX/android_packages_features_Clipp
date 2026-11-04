@@ -14,18 +14,41 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
-/** Compatible Clipp binary framing; authentication precedes every clipboard frame. */
+/**
+ * Clipp binary format, compatible with the desktop app.
+ *
+ * <p>A connection starts with a sealed handshake ({@link Channel}); after it every message is a
+ * length-prefixed secretstream frame. A frame starts with a 4-byte ASCII tag. "CLIP" frames carry
+ * a {@link #HEADER}-byte clip header followed by the clip data; the other tags are control
+ * messages handled in {@link ClippTransport}.
+ */
 public final class ClippWire {
-    public static final int HEADER = 285,
-            PNG = 8,
-            TEXT = 13,
-            JPEG = 0x434a5047,
-            MAX_IMAGE_BYTES = 50 * 1024 * 1024,
-            MAX_FRAME = MAX_IMAGE_BYTES + HEADER + 21;
+    /** Size of the packed clip header that follows the "CLIP" tag. */
+    public static final int HEADER = 285;
+    /** Clip formats; values match the desktop clipboard format IDs. */
+    public static final int PNG = 8, TEXT = 13, JPEG = 0x434a5047;
 
+    public static final int MAX_TEXT_BYTES = 1024 * 1024;
+    public static final int MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+
+    private static final int TAG_SIZE = 4;
+    /** Authentication tag and stream tag added by libsodium secretstream to every frame. */
+    private static final int STREAM_OVERHEAD = 17;
+    /** Bytes an encrypted "CLIP" frame adds to the clip header and data. */
+    public static final int FRAME_OVERHEAD = TAG_SIZE + STREAM_OVERHEAD;
+    /** Largest encrypted frame: a full image plus the tag, header and stream overhead. */
+    public static final int MAX_FRAME = MAX_IMAGE_BYTES + HEADER + FRAME_OVERHEAD;
+    /** Frames up to this size are read without taking the decoding budget. */
+    private static final int SMALL_FRAME = 4096;
+
+    /** History sent on connect; it must not change the receiver's clipboard. */
     public static final int FLAG_REPLAY = 1;
+    /** Marked private by the sender; never synced. */
     public static final int FLAG_PRIVATE = 2;
+    /** The receiver forwards the clip to its own peers. */
     public static final int FLAG_RELAY = 4;
 
     // Packed ClipboardMessage layout from upstream NetworkDefs.h (big endian).
@@ -72,6 +95,7 @@ public final class ClippWire {
         return ClippBytes.hex(a);
     }
 
+    /** Writes a NUL-terminated UTF-8 name, cut at a character boundary to fit. */
     public static void name(byte[] a, int offset, int size, String s) {
         byte[] value = utf8(s);
         int n = Math.min(size - 1, value.length);
@@ -79,12 +103,14 @@ public final class ClippWire {
         System.arraycopy(value, 0, a, offset, n);
     }
 
+    /** Reads a NUL-terminated UTF-8 name. */
     public static String name(byte[] a, int offset, int size) {
         int n = 0;
         while (n < size && a[offset + n] != 0) n++;
         return new String(a, offset, n, StandardCharsets.UTF_8);
     }
 
+    /** One clip: the raw header and the uncompressed data. */
     public static final class Item {
         public final byte[] header, data;
         public final int format, flags;
@@ -108,16 +134,18 @@ public final class ClippWire {
             return new Item(copy, data);
         }
 
+        /** Plain "CLIP" frame; {@code replay} marks it as history. */
         public byte[] frame(boolean replay) {
-            byte[] out = new byte[4 + HEADER + data.length];
-            System.arraycopy(utf8("CLIP"), 0, out, 0, 4);
-            System.arraycopy(header, 0, out, 4, HEADER);
-            if (replay) ByteBuffer.wrap(out).putInt(4 + FLAGS, flags | FLAG_REPLAY);
-            System.arraycopy(data, 0, out, 4 + HEADER, data.length);
+            byte[] out = new byte[TAG_SIZE + HEADER + data.length];
+            System.arraycopy(utf8("CLIP"), 0, out, 0, TAG_SIZE);
+            System.arraycopy(header, 0, out, TAG_SIZE, HEADER);
+            if (replay) ByteBuffer.wrap(out).putInt(TAG_SIZE + FLAGS, flags | FLAG_REPLAY);
+            System.arraycopy(data, 0, out, TAG_SIZE + HEADER, data.length);
             return out;
         }
     }
 
+    /** Builds the header for a clip copied on this device. */
     public static Item local(
             byte[] data, int format, byte[] host, String name, long sequence, long timestamp) {
         if (format == TEXT)
@@ -141,21 +169,25 @@ public final class ClippWire {
         return new Item(h, data);
     }
 
+    /**
+     * Parses a decrypted "CLIP" frame: checks the sizes, decompresses zstd data and verifies the
+     * content hash. The returned header always says "uncompressed".
+     */
     public static Item decode(byte[] frame, int imageLimit) throws IOException {
-        if (frame.length < 4 + HEADER) throw new IOException("Frame");
-        byte[] h = Arrays.copyOfRange(frame, 4, 4 + HEADER);
+        if (frame.length < TAG_SIZE + HEADER) throw new IOException("Frame");
+        byte[] h = Arrays.copyOfRange(frame, TAG_SIZE, TAG_SIZE + HEADER);
         ByteBuffer b = ByteBuffer.wrap(h);
         int format = b.getInt(FORMAT);
         long encoded = b.getLong(ENCODED_SIZE), plain = b.getLong(PLAIN_SIZE);
-        int limit = format == TEXT ? 1024 * 1024 : imageLimit;
+        int limit = format == TEXT ? MAX_TEXT_BYTES : imageLimit;
         if ((format != TEXT && format != PNG && format != JPEG)
                 || encoded < 0
-                || encoded != frame.length - 4 - HEADER
+                || encoded != frame.length - TAG_SIZE - HEADER
                 || plain < 0
                 || plain > limit
                 || h[COMPRESSED] < 0
                 || h[COMPRESSED] > 1) throw new IOException("Payload");
-        byte[] data = Arrays.copyOfRange(frame, 4 + HEADER, frame.length);
+        byte[] data = Arrays.copyOfRange(frame, TAG_SIZE + HEADER, frame.length);
         if (h[COMPRESSED] == 1)
             try {
                 data = ClippCrypto.decompress(data, (int) plain);
@@ -173,9 +205,17 @@ public final class ClippWire {
         return new Item(h, data);
     }
 
+    /**
+     * Encrypted connection to one peer.
+     *
+     * <p>Handshake: each side sends its key-exchange public key, host ID and name, sealed with a
+     * key derived from the group password, so only group members can read it. Session keys from
+     * crypto_kx then start one secretstream per direction, and the client confirms with "DONE".
+     */
     public static final class Channel {
         private final DataInputStream in;
         private final DataOutputStream out;
+        /** Secretstream states; native code updates them in place on every frame. */
         private byte[] tx, rx;
         private boolean receiveBudgetHeld;
         public final byte[] remoteId;
@@ -266,7 +306,7 @@ public final class ClippWire {
         }
 
         public synchronized void send(byte[] frame) throws IOException {
-            if (frame.length > MAX_FRAME - 17) throw new IOException("Frame limit");
+            if (frame.length > MAX_FRAME - STREAM_OVERHEAD) throw new IOException("Frame limit");
             try {
                 byte[] encrypted = ClippCrypto.push(tx, frame);
                 out.writeInt(encrypted.length);
@@ -281,36 +321,20 @@ public final class ClippWire {
             return receive(max, null);
         }
 
-        public byte[] receive(int max, java.util.concurrent.Semaphore budget) throws IOException {
+        /**
+         * Reads one frame. With a {@code budget}, large frames and every "CLIP" frame hold a
+         * permit until {@link #releaseReceiveBudget}, so peers decode clips one at a time
+         * instead of keeping many images in memory at once.
+         */
+        public byte[] receive(int max, Semaphore budget) throws IOException {
             int n = in.readInt();
-            if (n < 21 || n > Math.min(MAX_FRAME, max)) throw new IOException("Frame limit");
+            if (n < FRAME_OVERHEAD || n > Math.min(MAX_FRAME, max))
+                throw new IOException("Frame limit");
             boolean acquired = false, returned = false;
             try {
-                if (budget != null && n > 4096) {
-                    try {
-                        acquired = budget.tryAcquire(60, java.util.concurrent.TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Stopped", e);
-                    }
-                    if (!acquired) throw new IOException("Busy");
-                }
+                if (budget != null && n > SMALL_FRAME) acquired = acquire(budget);
                 byte[] frame = ClippCrypto.pull(rx, read(n));
-                if (budget != null
-                        && !acquired
-                        && frame.length >= 4
-                        && frame[0] == 67
-                        && frame[1] == 76
-                        && frame[2] == 73
-                        && frame[3] == 80) {
-                    try {
-                        acquired = budget.tryAcquire(60, java.util.concurrent.TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Stopped", e);
-                    }
-                    if (!acquired) throw new IOException("Busy");
-                }
+                if (budget != null && !acquired && isClip(frame)) acquired = acquire(budget);
                 receiveBudgetHeld = acquired;
                 returned = true;
                 return frame;
@@ -321,13 +345,32 @@ public final class ClippWire {
             }
         }
 
-        public void releaseReceiveBudget(java.util.concurrent.Semaphore budget) {
+        private static boolean acquire(Semaphore budget) throws IOException {
+            try {
+                if (budget.tryAcquire(60, TimeUnit.SECONDS)) return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Stopped", e);
+            }
+            throw new IOException("Busy");
+        }
+
+        private static boolean isClip(byte[] frame) {
+            return frame.length >= TAG_SIZE
+                    && frame[0] == 'C'
+                    && frame[1] == 'L'
+                    && frame[2] == 'I'
+                    && frame[3] == 'P';
+        }
+
+        public void releaseReceiveBudget(Semaphore budget) {
             if (receiveBudgetHeld) {
                 receiveBudgetHeld = false;
                 budget.release();
             }
         }
 
+        /** Clears the stream keys; the channel is unusable afterwards. */
         public synchronized void wipe() {
             if (tx != null) Arrays.fill(tx, (byte) 0);
             if (rx != null) Arrays.fill(rx, (byte) 0);

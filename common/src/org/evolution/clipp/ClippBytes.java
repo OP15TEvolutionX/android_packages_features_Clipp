@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package org.evolution.clipp;
 
-/** Allocation-bounded lowercase hex encoding for device IDs and content digests. */
+/** Lowercase hex encoding for device IDs and content digests. */
 public final class ClippBytes {
     private static final char[] HEX = "0123456789abcdef".toCharArray();
 

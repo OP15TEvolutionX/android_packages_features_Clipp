@@ -5,9 +5,13 @@ package org.evolution.clipp;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 
-/** Android clipboard content identity is separate from Clipp wire metadata. */
+/**
+ * Clip content as the Android clipboard sees it. {@link #key} identifies the content ("T:" or
+ * "I:" plus a SHA-256), so the same text or image is recognized whichever way it came.
+ */
 public final class ClippPayload {
     public final byte[] image;
+    /** {@code text} is the file name for an image; {@code mime} is null for text. */
     public final String text, mime, key;
 
     private ClippPayload(byte[] image, String text, String mime, String key) {

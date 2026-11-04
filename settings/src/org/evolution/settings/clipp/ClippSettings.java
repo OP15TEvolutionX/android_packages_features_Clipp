@@ -32,10 +32,16 @@ import org.evolution.clipp.ClippContract;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+/**
+ * Settings screen: the sync switch, preview switches, group setup and the list of peers.
+ * Everything is read from and written to {@code ClippConfigProvider}; peer states are refreshed
+ * while the screen is visible.
+ */
 public final class ClippSettings extends SettingsPreferenceFragment {
     private static final String[] PREVIEW_KEYS = {"showImagePreview", "showTextPreview"};
     private JSONObject config = new JSONObject();
     private final Handler main = new Handler(Looper.getMainLooper());
+    /** True while the group key is being derived. */
     private boolean preparing;
     private final ContentObserver observer =
             new ContentObserver(main) {
@@ -50,6 +56,7 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         return 0;
     }
 
+    /** Reloads the configuration, without the key, which this screen never needs. */
     private void read() {
         try {
             config = ClippContract.read(getContext().getContentResolver());
@@ -100,6 +107,7 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         config = next;
     }
 
+    /** Adds a switch stored under {@code key}; turning sync off also greys out the previews. */
     private void toggle(
             PreferenceGroup group, String key, int title, int summary, boolean initial) {
         SwitchPreferenceCompat p = new SwitchPreferenceCompat(getContext());
@@ -216,6 +224,7 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         }
     }
 
+    /** Rebuilds the peer list from the states SystemUI reported. */
     private void updateStates() {
         if (getPreferenceScreen() == null) return;
         PreferenceCategory category = findPreference("devices");
@@ -238,6 +247,7 @@ public final class ClippSettings extends SettingsPreferenceFragment {
         category.setVisible(category.getPreferenceCount() > 0);
     }
 
+    /** Dialog for the group name and password. */
     private void setup() {
         LinearLayout box = new LinearLayout(getContext());
         box.setOrientation(LinearLayout.VERTICAL);
@@ -263,66 +273,60 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                         .setNegativeButton(android.R.string.cancel, null)
                         .setPositiveButton(R.string.clipboard_sync_save, null)
                         .create();
+        // Validate before closing, so a short password keeps the dialog open.
         dialog.setOnShowListener(
                 d ->
                         dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                                 .setOnClickListener(
                                         v -> {
-                                            String name = group.getText().toString(),
-                                                    secret = password.getText().toString();
+                                            String name = group.getText().toString();
+                                            String secret = password.getText().toString();
                                             if (name.isEmpty() || secret.length() < 8) {
                                                 password.setError(
                                                         getString(R.string.clipboard_sync_invalid));
                                                 return;
                                             }
-                                            Context app = getContext().getApplicationContext();
-                                            preparing = true;
                                             dialog.dismiss();
                                             password.setText("");
-                                            build();
-                                            new Thread(
-                                                            () -> {
-                                                                boolean ok = true;
-                                                                try {
-                                                                    Bundle args = new Bundle();
-                                                                    args.putString("group", name);
-                                                                    args.putString(
-                                                                            "password", secret);
-                                                                    app.getContentResolver()
-                                                                            .call(
-                                                                                    ClippContract
-                                                                                            .CONFIG,
-                                                                                    "setup",
-                                                                                    null,
-                                                                                    args);
-                                                                    args.clear();
-                                                                } catch (Exception e) {
-                                                                    ok = false;
-                                                                }
-                                                                boolean success = ok;
-                                                                main.post(
-                                                                        () -> {
-                                                                            preparing = false;
-                                                                            if (!isAdded()) return;
-                                                                            read();
-                                                                            build();
-                                                                            Toast.makeText(
-                                                                                            getContext(),
-                                                                                            success
-                                                                                                    ? R
-                                                                                                            .string
-                                                                                                            .clipp_ready
-                                                                                                    : R
-                                                                                                            .string
-                                                                                                            .clipboard_sync_transfer_error,
-                                                                                            Toast
-                                                                                                    .LENGTH_LONG)
-                                                                                    .show();
-                                                                        });
-                                                            },
-                                                            "ClippGroupSetup")
-                                                    .start();
+                                            joinGroup(name, secret);
                                         }));
         dialog.show();
+    }
+
+    /** Derives the group key in the provider; Argon2 takes a while, so off the main thread. */
+    private void joinGroup(String name, String secret) {
+        Context app = getContext().getApplicationContext();
+        preparing = true;
+        build();
+        new Thread(
+                        () -> {
+                            boolean ok = true;
+                            try {
+                                Bundle args = new Bundle();
+                                args.putString("group", name);
+                                args.putString("password", secret);
+                                app.getContentResolver()
+                                        .call(ClippContract.CONFIG, "setup", null, args);
+                                args.clear();
+                            } catch (Exception e) {
+                                ok = false;
+                            }
+                            boolean success = ok;
+                            main.post(() -> onGroupJoined(success));
+                        },
+                        "ClippGroupSetup")
+                .start();
+    }
+
+    private void onGroupJoined(boolean success) {
+        preparing = false;
+        if (!isAdded()) return;
+        read();
+        build();
+        Toast.makeText(
+                        getContext(),
+                        success ? R.string.clipp_ready : R.string.clipboard_sync_transfer_error,
+                        Toast.LENGTH_LONG)
+                .show();
     }
 }

@@ -6,7 +6,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 
-/** Packed MDNSProtocol payload; Android DNS-SD and TXT encoding live in ClippTransport. */
+/**
+ * The 100-byte discovery packet from the desktop MDNSProtocol: magic, version, host ID and name.
+ * {@link ClippTransport} seals it with the group's discovery key and puts it in the "d" TXT
+ * record of the DNS-SD service.
+ */
 public final class ClippDiscovery {
     public static final String SERVICE_TYPE = "_clipp._tcp.";
     public static final String TXT_VERSION = "1";
@@ -27,6 +31,7 @@ public final class ClippDiscovery {
         return packet;
     }
 
+    /** Throws unless this is a version 1 packet of the right size. */
     public static void validate(byte[] packet) {
         if (packet.length != PACKET_SIZE
                 || ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).getInt(0) != MAGIC

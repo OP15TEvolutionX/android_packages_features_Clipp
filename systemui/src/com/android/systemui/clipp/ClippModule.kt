@@ -13,6 +13,10 @@ import dagger.multibindings.ClassKey
 import dagger.multibindings.IntoMap
 import javax.inject.Inject
 
+/**
+ * Runs one [ClippEngine] for the current user. The engine is closed before a user switch and a
+ * new one starts with the new user's context.
+ */
 @SysUISingleton
 class ClippStartable @Inject constructor(
     @Application private val context: Context,

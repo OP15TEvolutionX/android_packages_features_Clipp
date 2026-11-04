@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Base64;
+import android.util.Log;
 
 import org.evolution.clipp.ClippCrypto;
 
@@ -22,6 +23,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Collections;
@@ -47,11 +49,29 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Authenticated peers, each with the two directional links expected by Clipp. */
+/**
+ * Peer-to-peer part of Clipp on one Wi-Fi network.
+ *
+ * <p>The phone advertises itself over DNS-SD and finds peers the same way; the TXT record carries
+ * the host ID and name, sealed with the group key, so other groups can't read or fake it. Each
+ * peer gets two links, as the desktop app expects: the outgoing one, opened by us, sends our
+ * clips; the incoming one, opened by the peer, carries its clips to us. Outgoing links are retried
+ * with backoff until the peer stops advertising.
+ *
+ * <p>A transport is used once: {@link #close} stops everything, and the engine builds a new one.
+ */
 public final class ClippTransport implements AutoCloseable {
+    private static final String TAG = "ClippTransport";
+    /** Seconds before the next outgoing attempt, by attempt number; the last one repeats. */
+    private static final long[] RETRY_DELAYS_S = {2, 4, 8, 16, 32, 60, 120, 300};
+    /** At most this many unauthenticated incoming connections at a time. */
+    private static final int MAX_HANDSHAKES = 10;
+
     public interface Events {
+        /** Peer state for Settings: "connected", "disconnected" or "connection_error". */
         void state(String id, String name, String state);
 
+        /** A clip from a peer; called on the link's reader thread. */
         void receive(ClippWire.Item item);
     }
 
@@ -70,7 +90,9 @@ public final class ClippTransport implements AutoCloseable {
     private final ExecutorService writers =
             new ThreadPoolExecutor(
                     0, Integer.MAX_VALUE, 30, TimeUnit.SECONDS, new SynchronousQueue<>());
-    private final Semaphore decoding = new Semaphore(1), auth = new Semaphore(10);
+    /** One clip decoded at a time; see {@link ClippWire.Channel#receive}. */
+    private final Semaphore decoding = new Semaphore(1);
+    private final Semaphore auth = new Semaphore(MAX_HANDSHAKES);
     // Peer and link state is guarded by the peers monitor.
     // DNS-SD candidate/resolve collections below are confined to the main handler.
     private final Map<String, Peer> peers = new LinkedHashMap<>();
@@ -79,6 +101,7 @@ public final class ClippTransport implements AutoCloseable {
     private final ArrayDeque<NsdServiceInfo> resolveQueue = new ArrayDeque<>();
     private final Set<String> resolvingNames = new HashSet<>();
     private final Set<String> discoveredNames = new HashSet<>();
+    /** NsdManager resolves one service at a time, so resolves are queued. */
     private boolean resolving;
     // Main-thread only: successive transports wait for the previous NSD lifecycle to end.
     private static CompletableFuture<Void> previousStop = CompletableFuture.completedFuture(null);
@@ -87,6 +110,7 @@ public final class ClippTransport implements AutoCloseable {
     private final CompletableFuture<Void> resourcesStopped = new CompletableFuture<>();
     private final AtomicBoolean closeRequested = new AtomicBoolean();
     private volatile boolean closed;
+    /** Latest clip, sent to peers that ask for a sync. */
     private volatile ClippWire.Item latest;
     private ServerSocket listener;
     private final InetAddress localAddress;
@@ -95,12 +119,15 @@ public final class ClippTransport implements AutoCloseable {
     private NsdManager.DiscoveryListener discovery;
     private NsdManager.RegistrationListener registration;
 
+    /** A device in the group, keyed by its host ID. */
     private final class Peer {
         final String id;
         String name;
         InetAddress address;
         int port;
+        /** Seen over DNS-SD; only advertised peers get outgoing connections. */
         boolean advertised, connecting;
+        /** Failed outgoing attempts in a row, for the retry delay. */
         int attempt;
         Link incoming, outgoing;
         ScheduledFuture<?> retry;
@@ -115,6 +142,10 @@ public final class ClippTransport implements AutoCloseable {
         void run() throws IOException;
     }
 
+    /**
+     * One authenticated connection. Writes go through one writer task at a time: queued control
+     * commands first, then the newest pending clip. Older pending clips are dropped.
+     */
     private final class Link {
         final Socket socket;
         final ClippWire.Channel channel;
@@ -172,6 +203,7 @@ public final class ClippTransport implements AutoCloseable {
             drain();
         }
 
+        /** Writer thread only. A peer that stops reading loses the link after 30 s. */
         void send(byte[] frame) throws IOException {
             ScheduledFuture<?> deadline =
                     timers.schedule(() -> closeSocket(socket), 30, TimeUnit.SECONDS);
@@ -233,10 +265,12 @@ public final class ClippTransport implements AutoCloseable {
         main.post(this::startDiscovery);
     }
 
+    /** Keeps a clip for later syncs without sending it now. */
     public void remember(ClippWire.Item item) {
         latest = item;
     }
 
+    /** Sends a clip to every connected peer. */
     public void publish(ClippWire.Item item) {
         latest = item;
         synchronized (peers) {
@@ -291,12 +325,16 @@ public final class ClippTransport implements AutoCloseable {
                     closeSocket(s);
                 }
             } catch (IOException e) {
-
+                // The listener was closed.
                 break;
             }
         }
     }
 
+    /**
+     * Runs one connection on a reader thread: handshake, link registration, then the read loop
+     * until the socket closes. {@code expected} is the peer we dialled, or null for incoming.
+     */
     private void establish(Socket s, Peer expected, boolean outgoing) {
         boolean authHeld = !outgoing;
         Link link = null;
@@ -354,65 +392,17 @@ public final class ClippTransport implements AutoCloseable {
                 link.command(request);
             }
             while (!closed && !s.isClosed()) {
-                byte[] frame = channel.receive(imageLimit + ClippWire.HEADER + 21, decoding);
+                byte[] frame =
+                        channel.receive(
+                                imageLimit + ClippWire.HEADER + ClippWire.FRAME_OVERHEAD, decoding);
                 try {
-                    if (frame.length < 4) throw new IOException("Frame");
-                    String tag =
-                            new String(frame, 0, 4, java.nio.charset.StandardCharsets.US_ASCII);
-                    switch (tag) {
-                        case "PING":
-                            link.command(ClippWire.utf8("PONG"));
-                            break;
-                        case "PONG":
-                        case "NONE":
-                        case "CDEL":
-                        case "REGW":
-                        case "REOS":
-                        case "RDEL":
-                        case "RERR":
-                        case "ROKP":
-                            break;
-                        case "RSYN":
-                            // Desktop sends register anti-entropy even to clipboard-only peers.
-                            // We have no register store to contribute; finish without changing it.
-                            link.command(ClippWire.utf8("REOS"));
-                            break;
-                        case "CLIP":
-                            {
-                                ClippWire.Item item = ClippWire.decode(frame, imageLimit);
-                                if ((item.flags & ClippWire.FLAG_PRIVATE) != 0) break;
-                                if ((item.flags & ClippWire.FLAG_REPLAY) == 0) events.receive(item);
-                                break;
-                            }
-                        case "EOSY":
-                            break;
-                        case "SYNC":
-                            if (frame.length != 20) throw new IOException("Sync");
-                            ClippWire.Item snapshot = latest;
-                            Link sender = link;
-                            sender.command(
-                                    () -> {
-                                        if (snapshot != null) sender.send(snapshot.frame(true));
-                                        sender.send(ClippWire.utf8("EOSY"));
-                                    });
-                            break;
-                        case "RCNT":
-                            ClippWire.Item current = latest;
-                            if (current != null && current.format == ClippWire.TEXT)
-                                link.command(current.frame(false));
-                            else link.command(ClippWire.utf8("NONE"));
-                            break;
-                        default:
-                            // Authenticated protocol extensions must not disconnect clipboard sync.
-                            android.util.Log.d("ClippTransport", "Ignoring frame " + tag);
-                            break;
-                    }
+                    handleFrame(link, frame);
                 } finally {
                     channel.releaseReceiveBudget(decoding);
                 }
             }
         } catch (Exception failure) {
-            if (!closed) android.util.Log.w("ClippTransport", "Connection ended", failure);
+            if (!closed) Log.w(TAG, "Connection ended", failure);
             if (expected != null && !closed)
                 events.state(expected.id, expected.name, "connection_error");
         } finally {
@@ -447,61 +437,120 @@ public final class ClippTransport implements AutoCloseable {
         }
     }
 
+    /** Handles one decrypted frame from a link. */
+    private void handleFrame(Link link, byte[] frame) throws IOException {
+        if (frame.length < 4) throw new IOException("Frame");
+        String tag = new String(frame, 0, 4, StandardCharsets.US_ASCII);
+        switch (tag) {
+            case "PING":
+                link.command(ClippWire.utf8("PONG"));
+                break;
+            case "PONG":
+            case "NONE":
+            case "CDEL":
+            case "REGW":
+            case "REOS":
+            case "RDEL":
+            case "RERR":
+            case "ROKP":
+            case "EOSY":
+                break;
+            case "RSYN":
+                // Desktop sends register anti-entropy even to clipboard-only peers.
+                // We have no register store to contribute; finish without changing it.
+                link.command(ClippWire.utf8("REOS"));
+                break;
+            case "CLIP": {
+                ClippWire.Item item = ClippWire.decode(frame, imageLimit);
+                if ((item.flags & ClippWire.FLAG_PRIVATE) != 0) break;
+                if ((item.flags & ClippWire.FLAG_REPLAY) == 0) events.receive(item);
+                break;
+            }
+            case "SYNC": {
+                // The peer wants our latest clip as history, ended by "EOSY".
+                if (frame.length != 20) throw new IOException("Sync");
+                ClippWire.Item snapshot = latest;
+                link.command(
+                        () -> {
+                            if (snapshot != null) link.send(snapshot.frame(true));
+                            link.send(ClippWire.utf8("EOSY"));
+                        });
+                break;
+            }
+            case "RCNT": {
+                // The peer asks for our current text, if any.
+                ClippWire.Item current = latest;
+                if (current != null && current.format == ClippWire.TEXT)
+                    link.command(current.frame(false));
+                else link.command(ClippWire.utf8("NONE"));
+                break;
+            }
+            default:
+                // Authenticated protocol extensions must not disconnect clipboard sync.
+                Log.d(TAG, "Ignoring frame " + tag);
+                break;
+        }
+    }
+
+    /**
+     * Plans the next outgoing connection to an advertised peer that has none: now if
+     * {@code immediate}, otherwise after the backoff delay plus up to a second of jitter.
+     * Must hold {@link #peers}.
+     */
     private void schedule(Peer peer, boolean immediate) {
         if (closed || !peer.advertised || peer.outgoing != null || peer.connecting) return;
         if (peer.retry != null && !peer.retry.isDone()) {
             if (!immediate) return;
             peer.retry.cancel(false);
         }
-        long[] delays = {2, 4, 8, 16, 32, 60, 120, 300};
-        long seconds = immediate ? 0 : delays[Math.min(peer.attempt++, delays.length - 1)];
-        peer.retry =
-                timers.schedule(
-                        () -> {
-                            if (closed || !peer.advertised) return;
-                            synchronized (peers) {
-                                if (peer.connecting || peer.outgoing != null) return;
-                                peer.connecting = true;
-                                peer.retry = null;
-                            }
-                            try {
-                                readers.execute(
-                                        () -> {
-                                            Socket s = new Socket();
-                                            try {
-                                                network.bindSocket(s);
-                                                trackSocket(s);
-                                                s.connect(
-                                                        new InetSocketAddress(
-                                                                peer.address, peer.port),
-                                                        5000);
-                                                establish(s, peer, true);
-                                            } catch (Exception e) {
-                                                closeSocket(s);
-                                                if (!closed)
-                                                    synchronized (peers) {
-                                                        peer.connecting = false;
-                                                        events.state(
-                                                                peer.id,
-                                                                peer.name,
-                                                                "connection_error");
-                                                        schedule(peer, false);
-                                                    }
-                                            }
-                                        });
-                            } catch (RejectedExecutionException e) {
-                                synchronized (peers) {
-                                    peer.connecting = false;
-                                    schedule(peer, false);
-                                }
-                            }
-                        },
-                        seconds == 0
-                                ? 0
-                                : seconds * 1000 + ThreadLocalRandom.current().nextLong(1000),
-                        TimeUnit.MILLISECONDS);
+        long seconds =
+                immediate
+                        ? 0
+                        : RETRY_DELAYS_S[Math.min(peer.attempt++, RETRY_DELAYS_S.length - 1)];
+        long delayMs =
+                seconds == 0 ? 0 : seconds * 1000 + ThreadLocalRandom.current().nextLong(1000);
+        peer.retry = timers.schedule(() -> dial(peer), delayMs, TimeUnit.MILLISECONDS);
     }
 
+    /** Opens the outgoing connection to a peer; the connection then runs on a reader thread. */
+    private void dial(Peer peer) {
+        if (closed || !peer.advertised) return;
+        synchronized (peers) {
+            if (peer.connecting || peer.outgoing != null) return;
+            peer.connecting = true;
+            peer.retry = null;
+        }
+        try {
+            readers.execute(
+                    () -> {
+                        Socket s = new Socket();
+                        try {
+                            network.bindSocket(s);
+                            trackSocket(s);
+                            s.connect(new InetSocketAddress(peer.address, peer.port), 5000);
+                            establish(s, peer, true);
+                        } catch (Exception e) {
+                            closeSocket(s);
+                            if (!closed)
+                                synchronized (peers) {
+                                    peer.connecting = false;
+                                    events.state(peer.id, peer.name, "connection_error");
+                                    schedule(peer, false);
+                                }
+                        }
+                    });
+        } catch (RejectedExecutionException e) {
+            synchronized (peers) {
+                peer.connecting = false;
+                schedule(peer, false);
+            }
+        }
+    }
+
+    /**
+     * Main thread: starts accepting, advertises this device and starts discovery. Waits first
+     * until the previous transport has fully withdrawn its NSD service.
+     */
     private void startDiscovery() {
         if (closed || closeRequested.get()) return;
         if (!previousStop.isDone()) {
@@ -535,13 +584,12 @@ public final class ClippTransport implements AutoCloseable {
                         }
 
                         public void onRegistrationFailed(NsdServiceInfo i, int e) {
-                            android.util.Log.w("ClippTransport", "mDNS registration failed: " + e);
+                            Log.w(TAG, "mDNS registration failed: " + e);
                             advertisementStopped.complete(null);
                         }
 
                         public void onUnregistrationFailed(NsdServiceInfo i, int e) {
-                            android.util.Log.w(
-                                    "ClippTransport", "mDNS unregistration failed: " + e);
+                            Log.w(TAG, "mDNS unregistration failed: " + e);
                             advertisementStopped.complete(null);
                         }
                     };
@@ -555,63 +603,21 @@ public final class ClippTransport implements AutoCloseable {
                         }
 
                         public void onStartDiscoveryFailed(String t, int e) {
-                            android.util.Log.w("ClippTransport", "mDNS discovery failed: " + e);
+                            Log.w(TAG, "mDNS discovery failed: " + e);
                             discoveryStopped.complete(null);
                         }
 
                         public void onStopDiscoveryFailed(String t, int e) {
-                            android.util.Log.w(
-                                    "ClippTransport", "mDNS discovery stop failed: " + e);
+                            Log.w(TAG, "mDNS discovery stop failed: " + e);
                             discoveryStopped.complete(null);
                         }
 
                         public void onServiceFound(NsdServiceInfo service) {
-                            main.post(
-                                    () -> {
-                                        if (closed) return;
-                                        discoveredNames.add(service.getServiceName());
-                                        if (resolvingNames.contains(service.getServiceName()))
-                                            return;
-                                        resolvingNames.add(service.getServiceName());
-                                        resolveQueue.add(service);
-                                        resolveNext();
-                                    });
+                            main.post(() -> serviceFound(service));
                         }
 
                         public void onServiceLost(NsdServiceInfo service) {
-                            main.post(
-                                    () -> {
-                                        if (closed) return;
-                                        discoveredNames.remove(service.getServiceName());
-                                        if (!service.getServiceName().equals(resolvingName))
-                                            resolvingNames.remove(service.getServiceName());
-                                        resolveQueue.removeIf(
-                                                queued ->
-                                                        queued.getServiceName()
-                                                                .equals(service.getServiceName()));
-                                        NsdServiceInfo prior =
-                                                candidates.remove(service.getServiceName());
-                                        if (prior == null) return;
-                                        try {
-                                            String id = decodeId(prior);
-                                            for (NsdServiceInfo remaining : candidates.values())
-                                                if (id.equals(decodeId(remaining))) return;
-                                            synchronized (peers) {
-                                                Peer peer = peers.get(id);
-                                                if (peer != null) {
-                                                    peer.advertised = false;
-                                                    if (peer.retry != null)
-                                                        peer.retry.cancel(false);
-                                                    if (peer.incoming == null
-                                                            && peer.outgoing == null) {
-                                                        peers.remove(id);
-                                                        events.state(id, peer.name, "disconnected");
-                                                    }
-                                                }
-                                            }
-                                        } catch (Exception ignored) {
-                                        }
-                                    });
+                            main.post(() -> serviceLost(service));
                         }
                     };
             nsd.discoverServices(
@@ -622,10 +628,53 @@ public final class ClippTransport implements AutoCloseable {
                     discovery);
 
         } catch (Exception e) {
-            android.util.Log.w("ClippTransport", "mDNS start failed", e);
+            Log.w(TAG, "mDNS start failed", e);
         }
     }
 
+    /** Main thread: queues a newly seen service for resolving. */
+    private void serviceFound(NsdServiceInfo service) {
+        if (closed) return;
+        String serviceName = service.getServiceName();
+        discoveredNames.add(serviceName);
+        if (resolvingNames.contains(serviceName)) return;
+        resolvingNames.add(serviceName);
+        resolveQueue.add(service);
+        resolveNext();
+    }
+
+    /**
+     * Main thread: forgets a service. The peer stops being advertised once none of its services
+     * is left (a desktop may advertise more than one), and is removed if it has no links.
+     */
+    private void serviceLost(NsdServiceInfo service) {
+        if (closed) return;
+        String serviceName = service.getServiceName();
+        discoveredNames.remove(serviceName);
+        if (!serviceName.equals(resolvingName)) resolvingNames.remove(serviceName);
+        resolveQueue.removeIf(queued -> queued.getServiceName().equals(serviceName));
+        NsdServiceInfo prior = candidates.remove(serviceName);
+        if (prior == null) return;
+        try {
+            String id = decodeId(prior);
+            for (NsdServiceInfo remaining : candidates.values())
+                if (id.equals(decodeId(remaining))) return;
+            synchronized (peers) {
+                Peer peer = peers.get(id);
+                if (peer == null) return;
+                peer.advertised = false;
+                if (peer.retry != null) peer.retry.cancel(false);
+                if (peer.incoming == null && peer.outgoing == null) {
+                    peers.remove(id);
+                    events.state(id, peer.name, "disconnected");
+                }
+            }
+        } catch (Exception ignored) {
+            // Not one of our group's services.
+        }
+    }
+
+    /** Main thread: resolves the next queued service, one at a time. */
     private void resolveNext() {
         if (closed || resolving || resolveQueue.isEmpty()) return;
         resolving = true;
@@ -665,6 +714,7 @@ public final class ClippTransport implements AutoCloseable {
         }
     }
 
+    /** Opens the sealed TXT payload; throws if it isn't from our group. */
     private byte[] decode(NsdServiceInfo s) {
         Map<String, byte[]> attrs = s.getAttributes();
         if (!Arrays.equals(attrs.get("v"), ClippWire.utf8(ClippDiscovery.TXT_VERSION)))
@@ -689,6 +739,11 @@ public final class ClippTransport implements AutoCloseable {
         return true;
     }
 
+    /**
+     * A resolved service: records the peer's address, preferring an IPv4 address on our subnet,
+     * and connects to it if anything changed. Services of other groups fail to decode and are
+     * ignored.
+     */
     private void found(NsdServiceInfo s) {
         try {
             if (s.getNetwork() != null && !s.getNetwork().equals(network)) return;
@@ -762,7 +817,7 @@ public final class ClippTransport implements AutoCloseable {
             release.start();
         } catch (RuntimeException error) {
             if (cleanup.isHeld()) cleanup.release();
-            android.util.Log.w("ClippTransport", "mDNS cleanup wake lock failed", error);
+            Log.w(TAG, "mDNS cleanup wake lock failed", error);
         }
     }
 
@@ -775,7 +830,7 @@ public final class ClippTransport implements AutoCloseable {
             try {
                 nsd.unregisterService(previous);
             } catch (Exception error) {
-                android.util.Log.w("ClippTransport", "mDNS withdrawal failed", error);
+                Log.w(TAG, "mDNS withdrawal failed", error);
                 advertisementStopped.complete(null);
             }
         } else advertisementStopped.complete(null);
@@ -785,7 +840,7 @@ public final class ClippTransport implements AutoCloseable {
             try {
                 nsd.stopServiceDiscovery(previous);
             } catch (Exception error) {
-                android.util.Log.w("ClippTransport", "mDNS discovery stop failed", error);
+                Log.w(TAG, "mDNS discovery stop failed", error);
                 discoveryStopped.complete(null);
             }
         } else discoveryStopped.complete(null);

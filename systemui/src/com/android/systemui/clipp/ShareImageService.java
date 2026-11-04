@@ -31,12 +31,12 @@ import java.util.Comparator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Short-lived SystemUI service: copy while the sender's URI grant is held, then stop. */
+/**
+ * "Copy" share target: puts a shared image on the clipboard, from where the engine sends it to
+ * the peers. Runs in its own short-lived process; copies the image into the cache used by
+ * {@link ClipboardImageProvider} while the sender's URI grant is held, then stops.
+ */
 public final class ShareImageService extends Service {
-    private static final long MAX_IMAGE_BYTES = ClippWire.MAX_IMAGE_BYTES;
-    private static final long MAX_IMAGE_PIXELS = 32_000_000;
-    private static final long CACHE_BYTES = 200L * 1024 * 1024;
-    private static final long CACHE_AGE_MS = 24L * 60 * 60 * 1000;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
 
@@ -66,7 +66,7 @@ public final class ShareImageService extends Service {
     }
 
     private void copyImage(Uri source) throws IOException {
-        File directory = new File(getFilesDir(), "Clipp/images");
+        File directory = new File(getFilesDir(), ClippEngine.IMAGE_DIR);
         if (!directory.isDirectory() && !directory.mkdirs()) {
             throw new IOException("Cannot create image cache");
         }
@@ -86,7 +86,7 @@ public final class ShareImageService extends Service {
                 int count;
                 while ((count = input.read(buffer)) != -1) {
                     size += count;
-                    if (size > MAX_IMAGE_BYTES) throw new IOException("Image too large");
+                    if (size > ClippWire.MAX_IMAGE_BYTES) throw new IOException("Image too large");
                     digest.update(buffer, 0, count);
                     output.write(buffer, 0, count);
                 }
@@ -96,7 +96,7 @@ public final class ShareImageService extends Service {
             BitmapFactory.decodeFile(temporary.getPath(), info);
             if (info.outWidth <= 0
                     || info.outHeight <= 0
-                    || (long) info.outWidth * info.outHeight > MAX_IMAGE_PIXELS
+                    || (long) info.outWidth * info.outHeight > ClippEngine.MAX_IMAGE_PIXELS
                     || info.outMimeType == null
                     || !info.outMimeType.startsWith("image/")) {
                 throw new IOException("Invalid image");
@@ -108,6 +108,7 @@ public final class ShareImageService extends Service {
                     || !extension.matches("png|jpg|gif|webp|bmp|heic|heif|avif|wbmp")) {
                 throw new IOException("Unsupported image type");
             }
+            // Named by content, the same way the engine names received images.
             File image = new File(directory, ClippBytes.hex(digest.digest()) + "." + extension);
             if (!image.exists() && !temporary.renameTo(image))
                 throw new IOException("Cannot publish image");
@@ -130,6 +131,7 @@ public final class ShareImageService extends Service {
         }
     }
 
+    /** Drops day-old images, then the oldest ones while the cache is over its limit. */
     private static void pruneCache(File directory, File current) {
         File[] files =
                 directory.listFiles(file -> file.isFile() && !file.getName().endsWith(".tmp"));
@@ -137,10 +139,10 @@ public final class ShareImageService extends Service {
         Arrays.sort(files, Comparator.comparingLong(File::lastModified));
         long total = 0;
         for (File file : files) total += file.length();
-        long expired = System.currentTimeMillis() - CACHE_AGE_MS;
+        long expired = System.currentTimeMillis() - ClippEngine.IMAGE_CACHE_AGE_MS;
         for (File file : files) {
             if (file.equals(current)) continue;
-            if (file.lastModified() < expired || total > CACHE_BYTES) {
+            if (file.lastModified() < expired || total > ClippEngine.IMAGE_CACHE_BYTES) {
                 long size = file.length();
                 if (file.delete()) total -= size;
             }

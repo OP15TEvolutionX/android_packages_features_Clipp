@@ -14,19 +14,23 @@ import android.webkit.MimeTypeMap;
 import java.io.File;
 import java.io.FileNotFoundException;
 
-/** Read-only files granted by ClipboardService; no broad external storage access. */
+/**
+ * Serves cached clipboard images to the app that pastes them. Not exported: ClipboardService
+ * grants read access to the URI on the clipboard, nothing else is reachable.
+ */
 public final class ClipboardImageProvider extends ContentProvider {
     @Override
     public boolean onCreate() {
         return true;
     }
 
+    /** Only "<sha256>.<ext>" names map to files, so a URI can't reach outside the cache. */
     private File imageFile(Uri uri) throws FileNotFoundException {
         String name = uri.getLastPathSegment();
         if (name == null
                 || !name.matches("[a-f0-9]{64}\\.(png|jpg|gif|webp|bmp|heic|heif|avif|wbmp)"))
             throw new FileNotFoundException("Invalid image URI");
-        File f = new File(new File(getContext().getFilesDir(), "Clipp/images"), name);
+        File f = new File(new File(getContext().getFilesDir(), ClippEngine.IMAGE_DIR), name);
         if (!f.isFile()) throw new FileNotFoundException("Image unavailable");
         return f;
     }
