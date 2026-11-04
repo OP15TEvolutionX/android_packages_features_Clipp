@@ -19,7 +19,5 @@
   <string name="clipp_ready">Group configured. Enable clipboard sync to connect.</string>
   <string name="clipboard_sync_learn_more">Learn more about setting up clipboard sync...</string>
   <string name="clipboard_sync_show_image_preview">Show image preview</string>
-  <string name="clipboard_sync_show_image_preview_summary">Shows images received from other devices in a pop-up panel</string>
   <string name="clipboard_sync_show_text_preview">Show text preview</string>
-  <string name="clipboard_sync_show_text_preview_summary">Shows text received from other devices in a pop-up panel</string>
 </resources>

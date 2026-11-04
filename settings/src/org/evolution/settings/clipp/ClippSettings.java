@@ -155,13 +155,13 @@ public final class ClippSettings extends SettingsPreferenceFragment {
                 screen,
                 "showImagePreview",
                 R.string.clipboard_sync_show_image_preview,
-                R.string.clipboard_sync_show_image_preview_summary,
+                0,
                 legacyPreview);
         toggle(
                 screen,
                 "showTextPreview",
                 R.string.clipboard_sync_show_text_preview,
-                R.string.clipboard_sync_show_text_preview_summary,
+                0,
                 legacyPreview);
         for (String preview : PREVIEW_KEYS) {
             findPreference(preview).setEnabled(config.optBoolean("enabled"));
